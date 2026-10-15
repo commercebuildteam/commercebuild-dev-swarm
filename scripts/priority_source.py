@@ -2,8 +2,11 @@
 import datetime,json,pathlib,re,subprocess
 RANK={'Promotion':0,'Urgent':1,'High':2,'Medium':3,'Low':4}
 FIELDS='issueFieldValues(first:30){nodes{... on IssueFieldSingleSelectValue{name field{... on IssueFieldSingleSelect{name}}}}}'
+LABELS='labels(first:10){nodes{name}}'
+LABEL_PRIORITY=re.compile(r'^(?:p(?:riority)?[:_ -]*)?(urgent|high|medium|low)$',re.I)
 def priority(node):
  values=[v['name'] for v in node.get('issueFieldValues',{}).get('nodes',[]) if v.get('field',{}).get('name')=='Priority']
+ values+=[m.group(1).capitalize() for m in (LABEL_PRIORITY.match(n.get('name','')) for n in node.get('labels',{}).get('nodes',[])) if m]
  return min(values,key=lambda v:RANK.get(v,99)) if values else None
 def query(q):
  p=subprocess.run(['gh','api','graphql','-f','query='+q],capture_output=True,text=True,timeout=25)
@@ -16,19 +19,20 @@ def collect(base):
  if path.exists():
   old=json.loads(path.read_text())
   if (now-datetime.datetime.fromisoformat(old['captured_at'])).total_seconds()<60:return old
- result={'captured_at':now.isoformat(),'scope':'Open assigned commercebuild issues and open commercebuild-authored PRs; maximum 300 each. Linked issues may be assigned to another owner. Evidence only.','items':[],'errors':[],'truncated':{}}
+ result={'captured_at':now.isoformat(),'scope':'Open assigned commercebuild issues and open commercebuild- or donavon-commercebuild-authored PRs; maximum 300 each. Linked issues may be assigned to another owner. Evidence only.','items':[],'errors':[],'truncated':{}}
  issues={};prs=[]
  try:
   for kind,search,fragment in [
-   ('issues','org:commercebuildteam is:issue is:open assignee:commercebuild','... on Issue{url title updatedAt repository{nameWithOwner} '+FIELDS+'}'),
-   ('prs','org:commercebuildteam is:pr is:open author:commercebuild','... on PullRequest{url title body reviewDecision isDraft closingIssuesReferences(first:20){nodes{url '+FIELDS+'}}}')]:
+   ('issues','org:commercebuildteam is:issue is:open assignee:commercebuild','... on Issue{url title updatedAt repository{nameWithOwner} '+FIELDS+' '+LABELS+'}'),
+   ('prs','org:commercebuildteam is:pr is:open author:commercebuild','... on PullRequest{url title body reviewDecision isDraft closingIssuesReferences(first:20){nodes{url '+FIELDS+' '+LABELS+'}}}'),
+   ('prs','org:commercebuildteam is:pr is:open author:donavon-commercebuild','... on PullRequest{url title body reviewDecision isDraft closingIssuesReferences(first:20){nodes{url '+FIELDS+' '+LABELS+'}}}')]:
    cursor=None
    for page in range(3):
     after=',after:'+json.dumps(cursor) if cursor else ''
     data=query('{search(query:'+json.dumps(search)+',type:ISSUE,first:100'+after+'){pageInfo{hasNextPage endCursor} nodes{'+fragment+'}}}')['search']
     for n in data['nodes']:
      if kind=='issues':issues[n['url']]=n
-     else:prs.append(n)
+     elif n['url'] not in {x['url'] for x in prs}:prs.append(n)
     result['truncated'][kind]=data['pageInfo']['hasNextPage']
     if not data['pageInfo']['hasNextPage']:break
     cursor=data['pageInfo']['endCursor']
@@ -65,7 +69,7 @@ def collect(base):
  except (RuntimeError,subprocess.TimeoutExpired,ValueError) as exc:result['errors'].append(str(exc) if isinstance(exc,RuntimeError) else type(exc).__name__)
  result['items'].sort(key=lambda x:(RANK.get(x['priority'],99),x['url']))
  result['unset_count']=sum(x['priority'] is None for x in result['items'])
- result['limitations']='No priority inferred from security severity, text, or labels. Non-closing references to issues outside assigned scan can remain unknown. Unknown never means Low. Ranking does not grant assignment or override review, runtime, repository locks, or stop markers.'
+ result['limitations']='No priority inferred from security severity or text. Project and priority-label values are honored. Non-closing references to issues outside assigned scan can remain unknown. Unknown never means Low. Ranking does not grant assignment or override review, runtime, repository locks, or stop markers.'
  tmp=path.with_suffix('.tmp');tmp.write_text(json.dumps(result,indent=2));tmp.replace(path)
  return result
 if __name__=='__main__':

@@ -15,7 +15,7 @@ import subprocess
 RANK = {'Promotion': 0}
 REFRESH_SECONDS = 60
 MAX_SEARCH_PAGES = 3
-MAX_DETAIL_PER_REFRESH = 25
+MAX_DETAIL_PER_REFRESH = 40
 
 # A promotion PR targets a release or stable branch. Both channels take precedence.
 PROMO_TARGET = re.compile(r'^(release(?:/.+)?|stable(?:/.+)?)$', re.IGNORECASE)
@@ -26,7 +26,10 @@ PREPARED_HEAD = re.compile(r'^(cb-promotion|promotion-prepare|promote)', re.IGNO
 # custom tokens instead of a plain branch word.
 ENCODED_HEAD = re.compile(r'%[0-9a-fA-F]{2}|[A-Za-z0-9]+-[0-9a-f]{8,}', re.IGNORECASE)
 REPLACEMENT = re.compile(r'replacement', re.IGNORECASE)
-PROMO_TITLE = re.compile(r'\bpromot\w*\b|\brelease\s+v?\d+\.\d+', re.IGNORECASE)
+# Title words only prioritize which candidates are verified first within the
+# per-refresh budget; branch structure verification alone classifies, and the
+# rotation reaches every open PR.
+PROMO_TITLE = re.compile(r'\bpromot\w*\b|\brelease\s+v?\d+|\bmaster-to-release\b', re.IGNORECASE)
 BOT_LOGINS = {'commercebuild', 'github-actions', 'commercebuild-bot'}
 
 
@@ -49,7 +52,8 @@ def search_open_prs():
     """Bounded, paginated open-PR search across all non-archived org repositories."""
     rows, cursor = [], None
     for _ in range(MAX_SEARCH_PAGES):
-        command = ['gh', 'api', '--method', 'GET', 'search/issues', '-f',
+        # gh() prepends the gh executable itself; the command must not repeat it.
+        command = ['api', '--method', 'GET', 'search/issues', '-f',
                    'q=org:commercebuildteam is:pr is:open archived:false',
                    '-f', 'sort=updated', '-f', 'order=desc', '-f', 'per_page=100']
         if cursor:
@@ -74,7 +78,8 @@ def search_open_prs():
 def pr_detail(repo, number):
     """Branch source/target, draft, author, and merge state for one PR."""
     data = gh('api', f'repos/{repo}/pulls/{number}', '--jq',
-              '{head: .head.ref, base: .base.ref, draft: .draft, state: .state, '
+              '{head: .head.ref, base: .base.ref, sha: .head.sha, '
+              'head_repo: .head.repo.full_name, draft: .draft, state: .state, '
               'author: .user.login, mergeable: .mergeable_state, title: .title, '
               'body: (.body // "")}')
     return data
@@ -82,9 +87,15 @@ def pr_detail(repo, number):
 
 def branch_evidence(detail):
     """Verified promotion branch structure: a release/stable target with a
-    promotion-prepared, default, encoded/custom, or replacement head."""
+    promotion-prepared, default, encoded/custom, or replacement head.
+
+    The head SHA and owning repository are verified against the live PR detail;
+    a branch name alone is naming, never proof the source branch exists.
+    """
     base = (detail.get('base') or '').strip()
     head = (detail.get('head') or '').strip()
+    sha = (detail.get('sha') or '').strip()
+    head_repo = (detail.get('head_repo') or '').strip()
     if not PROMO_TARGET.match(base):
         return None
     kinds = []
@@ -96,7 +107,9 @@ def branch_evidence(detail):
         kinds.append('encoded-custom-head')
     if not kinds:
         return None
-    return {'head': head, 'base': base, 'head_kinds': kinds}
+    verified = bool(re.fullmatch(r'[0-9a-f]{40}', sha) and head_repo)
+    return {'head': head, 'base': base, 'head_kinds': kinds, 'sha': sha,
+            'head_repo': head_repo, 'verified': verified}
 
 
 def classify(detail):
@@ -122,6 +135,8 @@ def classify(detail):
         'verified_at': detail.get('verified_at') or '',
     }
     blocked = []
+    if not evidence['verified']:
+        blocked.append('head SHA or source repository unverified; branch evidence incomplete')
     if item['draft']:
         blocked.append('draft PR: hold until marked ready')
     if item['mergeable'] in ('dirty', 'blocked', 'unstable'):
@@ -155,21 +170,28 @@ def collect(state):
     except (KeyError, ValueError, TypeError):
         pass
     result = {'captured_at': now.isoformat(), 'interval_seconds': REFRESH_SECONDS,
-              'items': old.get('items') or [], 'errors': [], 'truncated': False,
+              'items': [], 'errors': [], 'truncated': False,
               'unverified': {}}
     try:
         rows = search_open_prs()
-        candidates = []
-        for row in rows:
-            # Cheap branch-agnostic title filter first; verification decides.
-            if PROMO_TITLE.search(row['title'] or ''):
-                candidates.append(row)
+        open_urls = {row['url'] for row in rows}
+        # Rotation: each refresh verifies the next slice of the open-PR list so a
+        # large organization is covered over consecutive refreshes. Likely
+        # promotions (by title) are verified first for fresh discovery.
+        start = int(old.get('cursor') or 0) % len(rows) if rows else 0
+        ordered = rows[start:] + rows[:start]
+        likely = {r['url'] for r in ordered if PROMO_TITLE.search(r['title'] or '')}
+        queue = [r for r in ordered if r['url'] in likely] + \
+                [r for r in ordered if r['url'] not in likely]
+        fresh, examined = [], set()
         detail_budget = MAX_DETAIL_PER_REFRESH
-        for row in candidates:
+        for row in queue:
+            # No title filter here: a custom or replacement promotion may not carry
+            # the keywords. Branch structure verification decides classification.
             if detail_budget <= 0:
-                result['unverified'][row['url']] = 'detail verification deferred to the next refresh'
-                continue
+                break
             detail_budget -= 1
+            examined.add(row['url'])
             try:
                 detail = pr_detail(row['repo'], row['number'])
                 detail.update({'url': row['url'], 'updatedAt': row['updatedAt'],
@@ -179,13 +201,24 @@ def collect(state):
                 result['errors'].append(f'{row["url"]}: {type(exc).__name__}')
                 continue
             if item:
-                # Replace any prior record for the same PR; dedupe by URL.
-                result['items'] = [i for i in result['items'] if i['url'] != item['url']]
-                result['items'].append(item)
-        result['truncated'] = detail_budget <= 0
+                fresh = [i for i in fresh if i['url'] != item['url']]
+                fresh.append(item)
+        fresh_urls = {i['url'] for i in fresh}
+        # Rebuild from live search: a merged or closed promotion disappears instead
+        # of ranking forever. Still-open items this refresh could not verify stay
+        # visible with their previous evidence until the rotation reaches them.
+        kept = [i for i in old.get('items') or []
+                if i['url'] in open_urls and i['url'] not in fresh_urls
+                and i['url'] not in examined]
+        result['items'] = fresh + kept
+        result['unverified'] = {row['url']: 'detail verification deferred to a later refresh'
+                                for row in queue if row['url'] not in examined}
+        result['truncated'] = detail_budget <= 0 and len(queue) > len(examined)
+        result['cursor'] = (start + len(examined)) % len(rows) if rows else 0
     except (subprocess.SubprocessError, RuntimeError, ValueError, OSError) as exc:
         result['errors'].append(str(exc) if isinstance(exc, RuntimeError) else type(exc).__name__)
         # Rate limiting and permission failures keep last-known items visible.
+        result['items'] = old.get('items') or []
         result['last_success_at'] = old.get('last_success_at')
     else:
         result['last_success_at'] = now.isoformat()

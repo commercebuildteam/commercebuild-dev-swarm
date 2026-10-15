@@ -19,6 +19,7 @@ import threading
 import time
 import uuid
 import priority_schedule
+import promotion_source
 import review_intake
 
 STATE = Path.home() / '.agents/state/commercebuild-opencode-swarm'
@@ -1345,6 +1346,9 @@ def dispatch_round(args, model, session):
     """Keep up to SLOTS workers live, refill a slot as soon as it frees, and end the
     round only when nothing is running, nothing is pending, and intake found nothing."""
     priority_schedule.refresh(STATE, background=False)
+    # The review-intake poller starts with dispatch too, not only the dashboard
+    # server, so a Donavon request is queued even when nobody is watching the page.
+    review_intake.start(STATE)
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=SLOTS)
     futures = {}
     known = set()  # queue entries already handled this round, keyed by entry_key()
@@ -1805,6 +1809,30 @@ def repository_last_served():
     return last
 
 
+def high_tier_rows(state, seen_urls):
+    """Extra intake rows from the promotion and Donavon-review snapshots.
+
+    Promotions are the top scheduling tier and enter the runnable queue like any
+    other ticket. Donavon-requested reviews are ingested independently of developer
+    capacity; the two-concurrent review cap is applied at dispatch time, so a request
+    recorded while every slot is full is still queued and starts when a slot frees.
+    """
+    sources = ((promotion_source.items(state), 'updatedAt'),
+               ((i for i in review_intake.snapshot(state).get('items', [])
+                 if i.get('donavon_request')), 'updated_at'))
+    extra = []
+    for candidates, updated_key in sources:
+        for candidate in candidates:
+            url = candidate.get('url') or ''
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            extra.append({'url': url, 'title': candidate.get('title') or '',
+                          'updatedAt': candidate.get(updated_key) or '',
+                          'repository': {'nameWithOwner': '/'.join(url.split('/')[3:5])}})
+    return extra
+
+
 def issue_requires_reassessment(item):
     """A linked PR is not evidence that newer issue instructions are satisfied."""
     cp = read(STATE / 'checkpoints' / (worker_id_for(item['url']) + '.json'))
@@ -1852,6 +1880,7 @@ def direct_intake(session, limit=SLOTS, assignee=DEFAULT_ASSIGNEE):
     for candidate in priority_schedule.snapshot(STATE).get('items', []):
         if candidate.get('kind') == 'issue' and candidate['url'] not in seen_urls:
             rows.append(candidate);seen_urls.add(candidate['url'])
+    rows.extend(high_tier_rows(STATE, seen_urls))
     rows = routed_rows(rows)
     seen_urls = {r['url'] for r in rows}
     # A PR and the issue it references are one work item; keep the PR (it carries the

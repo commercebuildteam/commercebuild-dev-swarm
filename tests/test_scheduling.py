@@ -21,9 +21,11 @@ import review_intake
 
 
 def promotion_node(base='release', head='cb-promotion/release-3.4', author='commercebuild',
-                   draft=False, mergeable='clean', title='Promotion: release 3.4'):
+                   draft=False, mergeable='clean', title='Promotion: release 3.4',
+                   sha='a' * 40, head_repo='commercebuildteam/client-site'):
     return {'url': 'https://github.com/commercebuildteam/client-site/pull/99',
             'title': title, 'base': base, 'head': head, 'draft': draft,
+            'sha': sha, 'head_repo': head_repo,
             'author': author, 'mergeable': mergeable,
             'body': 'Promotion PR.', 'updatedAt': '2026-10-15T10:00:00Z',
             'verified_at': '2026-10-15T10:00:00Z'}
@@ -67,6 +69,12 @@ class PromotionClassification(unittest.TestCase):
         self.assertEqual(item['next_owner'], 'donavon-commercebuild')
         clean = promotion_source.classify(promotion_node(mergeable='clean'))
         self.assertEqual(clean['next_owner'], 'bhalecb')
+
+    def test_unverified_head_sha_blocks_classification(self):
+        item = promotion_source.classify(promotion_node(sha='', head_repo=''))
+        self.assertFalse(item['branch_evidence']['verified'])
+        self.assertTrue(item['blocked'])
+        self.assertIn('unverified', item['blocked'][0])
 
     def test_unrelated_promotion_mention_is_negative(self):
         item = promotion_source.classify(promotion_node(base='main', head='feature/promo-page'))
@@ -122,6 +130,62 @@ class PromotionCollection(unittest.TestCase):
         self.assertEqual(result['items'], good['items'])
         self.assertTrue(result['errors'])
         self.assertEqual(result['last_success_at'], good['last_success_at'])
+
+    def test_promotion_without_title_keywords_is_classified(self):
+        """Branch structure decides, not the title: a custom or replacement
+        promotion whose title lacks the promotion words is never skipped."""
+        search = {'total_count': 1, 'incomplete_results': False, 'items': [
+            {'number': 99, 'html_url': promotion_node()['url'], 'title': 'Update dependencies',
+             'repository_url': 'https://api.github.com/repos/commercebuildteam/client-site',
+             'updated_at': '2026-10-15T10:00:00Z', 'user': {'login': 'commercebuild'},
+             'draft': False}]}
+        details = {'99': dict(promotion_node(), title='Update dependencies',
+                              url=promotion_node()['url'])}
+        with mock.patch.object(promotion_source.subprocess, 'run', self.fake_gh(
+                {**search, 'details': details})):
+            result = promotion_source.collect(self.state)
+        self.assertEqual(len(result['items']), 1)
+        self.assertEqual(result['items'][0]['priority'], 'Promotion')
+
+    def test_second_refresh_drops_a_merged_promotion(self):
+        url = promotion_node()['url']
+        search = {'total_count': 0, 'incomplete_results': False, 'items': []}
+        (self.state / 'promotion-snapshot.json').write_text(json.dumps(
+            {'captured_at': '2020-01-01T00:00:00+00:00',
+             'items': [{'url': url, 'priority': 'Promotion'}],
+             'errors': [], 'last_success_at': '2026-10-15T09:00:00Z'}))
+        with mock.patch.object(promotion_source.subprocess, 'run',
+                               self.fake_gh({**search, 'details': {}})):
+            result = promotion_source.collect(self.state)
+        self.assertEqual(result['items'], [])
+        self.assertFalse(result['errors'])
+
+    def test_budget_rotation_keeps_unverified_open_promotions_visible(self):
+        """A still-open promotion beyond this refresh's detail budget keeps its prior
+        evidence until the rotation reaches it; the cursor advances."""
+        url_a = promotion_node()['url']
+        url_b = 'https://github.com/commercebuildteam/other/pull/55'
+        search = {'total_count': 2, 'incomplete_results': False, 'items': [
+            {'number': 99, 'html_url': url_a, 'title': 'Promotion: release 3.4',
+             'repository_url': 'https://api.github.com/repos/commercebuildteam/client-site',
+             'updated_at': '2026-10-15T10:00:00Z', 'user': {'login': 'commercebuild'}, 'draft': False},
+            {'number': 55, 'html_url': url_b, 'title': 'Update deps',
+             'repository_url': 'https://api.github.com/repos/commercebuildteam/other',
+             'updated_at': '2026-10-15T09:00:00Z', 'user': {'login': 'bhalecb'}, 'draft': False}]}
+        details = {'99': dict(promotion_node(), url=url_a)}
+        (self.state / 'promotion-snapshot.json').write_text(json.dumps(
+            {'captured_at': '2020-01-01T00:00:00+00:00',
+             'items': [{'url': url_a, 'priority': 'Promotion'},
+                       {'url': url_b, 'priority': 'Promotion'}],
+             'errors': [], 'last_success_at': '2026-10-15T08:00:00Z'}))
+        with mock.patch.object(promotion_source.subprocess, 'run', self.fake_gh(
+                {**search, 'details': details})), \
+             mock.patch.object(promotion_source, 'MAX_DETAIL_PER_REFRESH', 1):
+            result = promotion_source.collect(self.state)
+        urls = {i['url'] for i in result['items']}
+        self.assertEqual(urls, {url_a, url_b})
+        self.assertTrue(result['truncated'])
+        self.assertEqual(result['cursor'], 1)
 
     def test_merge_supersets_ticket_items(self):
         data = {'captured_at': '2020-01-01T00:00:00+00:00',
@@ -208,20 +272,58 @@ class DonavonClassification(unittest.TestCase):
         self.assertFalse(item['donavon_request'])
 
     def test_bare_mention_comment_is_never_high(self):
-        comments = [{'id': 1, 'user': {'login': 'donavon-commercebuild'},
+        comments = [{'id': 1, 'user': 'donavon-commercebuild',
                      'body': 'cc bhalecb, FYI on this PR', 'created_at': '2026-10-15T11:00:00Z'}]
         item = review_intake.classify(intake_node(actor='bhalecb'),
                                       review_intake.explicit_comment_requests(comments))
         self.assertIsNone(item['priority'])
 
     def test_explicit_comment_request_is_high(self):
-        comments = [{'id': 5, 'user': {'login': 'donavon-commercebuild'},
+        comments = [{'id': 5, 'user': 'donavon-commercebuild',
                      'body': '@bhalecb please review this promotion follow-up',
                      'created_at': '2026-10-15T11:00:00Z'}]
         evidence = review_intake.explicit_comment_requests(comments)
         item = review_intake.classify(intake_node(actor='bhalecb'), evidence)
         self.assertEqual(item['priority'], 'High')
         self.assertEqual(item['request_evidence'][0]['kind'], 'comment')
+
+    def test_comment_only_request_qualifies_without_assignment(self):
+        """A Donavon request in a PR comment is valid evidence even when the PR has
+        no current assignment and no review-request event."""
+        node = intake_node(actor='someone-else')
+        node['assignees']['nodes'] = []
+        node['reviewRequests']['nodes'] = []
+        comments = [{'id': 9, 'user': 'donavon-commercebuild',
+                     'body': 'bhalecb, can you review this today?', 'created_at': '2026-10-15T11:00:00Z'}]
+        item = review_intake.classify(node, review_intake.explicit_comment_requests(comments))
+        self.assertEqual(item['priority'], 'High')
+        self.assertTrue(item['donavon_request'])
+        self.assertEqual(item['state'], 'requires-bhalecb-routing')
+
+    def test_comment_fetch_uses_http_get(self):
+        """gh -f switches to POST unless --method GET is explicit."""
+        calls = []
+
+        def run(command, **kwargs):
+            calls.append(command)
+            return mock.Mock(returncode=0, stdout='[]', stderr='')
+
+        with mock.patch.object(review_intake.subprocess, 'run', run):
+            review_intake.comments_for(DONAVON_PR)
+        self.assertIn('--method', calls[0])
+        self.assertEqual(calls[0][calls[0].index('--method') + 1], 'GET')
+
+    def test_comment_user_shape_matches_live_boundary(self):
+        """comments_for flattens user to the login string; the nested raw-API shape
+        still resolves for robustness."""
+        flat = review_intake.explicit_comment_requests(
+            [{'id': 3, 'user': 'donavon-commercebuild', 'body': 'bhalecb, please review',
+              'created_at': '2026-10-15T11:00:00Z'}])
+        self.assertEqual(len(flat), 1)
+        nested = review_intake.explicit_comment_requests(
+            [{'id': 4, 'user': {'login': 'donavon-commercebuild'}, 'body': 'bhalecb, please review',
+              'created_at': '2026-10-15T11:00:00Z'}])
+        self.assertEqual(len(nested), 1)
 
     def test_request_by_another_actor_is_not_donavon(self):
         item = review_intake.classify(intake_node(actor='someone-else'))
@@ -331,6 +433,89 @@ class Freshness(unittest.TestCase):
                                self.fake_time_module(61)):
             priority_source.collect(self.state)
         self.assertTrue(calls)
+
+
+class TicketPriorityLabels(unittest.TestCase):
+    def test_priority_label_inherited_without_project_field(self):
+        node = {'issueFieldValues': {'nodes': []},
+                'labels': {'nodes': [{'name': 'priority: urgent'}, {'name': 'bug'}]}}
+        self.assertEqual(priority_source.priority(node), 'Urgent')
+
+    def test_plain_priority_labels(self):
+        node = {'issueFieldValues': {'nodes': []},
+                'labels': {'nodes': [{'name': 'High'}]}}
+        self.assertEqual(priority_source.priority(node), 'High')
+
+    def test_unrelated_labels_do_not_rank(self):
+        node = {'issueFieldValues': {'nodes': []},
+                'labels': {'nodes': [{'name': 'high priority customer note'}]}}
+        self.assertIsNone(priority_source.priority(node))
+
+    def test_project_field_beats_nothing_but_urgency_wins_over_high(self):
+        node = {'issueFieldValues': {'nodes': [
+                    {'name': 'High', 'field': {'name': 'Priority'}}],
+                },
+                'labels': {'nodes': [{'name': 'urgent'}]}}
+        self.assertEqual(priority_source.priority(node), 'Urgent')
+
+
+class MergedEvidenceAndDispatch(unittest.TestCase):
+    def setUp(self):
+        self.state = Path(tempfile.mkdtemp())
+
+    def test_merged_snapshot_supplies_high_floor_and_promotion_supersedes(self):
+        pr = DONAVON_PR
+        promo = promotion_node()['url']
+        (self.state / 'priority-snapshot.json').write_text(json.dumps(
+            {'captured_at': '2026-10-15T10:00:00Z',
+             'items': [{'url': pr, 'priority': None},
+                       {'url': promo, 'priority': 'Medium'}]}))
+        (self.state / 'review-intake.json').write_text(json.dumps(
+            {'items': [{'url': pr, 'donavon_request': True, 'priority': 'High'}]}))
+        (self.state / 'promotion-snapshot.json').write_text(json.dumps(
+            {'items': [{'url': promo, 'priority': 'Promotion'}]}))
+        merged = priority_schedule.merged_snapshot(self.state)
+        by_url = {i['url']: i for i in merged['items']}
+        self.assertEqual(by_url[pr]['priority'], 'High')
+        self.assertEqual(by_url[promo]['priority'], 'Promotion')
+        # Ordering reflects both tiers.
+        ordered = priority_schedule.order([{'url': pr}, {'url': promo}], self.state)
+        self.assertEqual([r['url'] for r in ordered], [promo, pr])
+
+    def test_intake_rows_carry_promotions_and_donavon_reviews(self):
+        """The runnable queue's intake includes promotion and Donavon-review rows,
+        each mapped to its repository for claiming."""
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            'swarm_opencode_under_test',
+            Path(__file__).resolve().parent.parent / 'scripts' / 'swarm-opencode.py')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        (self.state / 'promotion-snapshot.json').write_text(json.dumps(
+            {'items': [{'url': promotion_node()['url'], 'title': 'Promotion',
+                        'updatedAt': '2026-10-15T10:00:00Z'}]}))
+        (self.state / 'review-intake.json').write_text(json.dumps(
+            {'items': [{'url': DONAVON_PR, 'title': 'Fix thing', 'donavon_request': True,
+                        'priority': 'High', 'updated_at': '2026-10-15T11:00:00Z'},
+                       {'url': 'https://github.com/commercebuildteam/r/pull/8',
+                        'donavon_request': False}]}))
+        seen = set()
+        rows = module.high_tier_rows(self.state, seen)
+        by_url = {r['url']: r for r in rows}
+        self.assertIn(promotion_node()['url'], by_url)
+        self.assertIn(DONAVON_PR, by_url)
+        self.assertNotIn('https://github.com/commercebuildteam/r/pull/8', by_url)
+        self.assertEqual(by_url[DONAVON_PR]['repository']['nameWithOwner'], 'commercebuildteam/r')
+        # Seen URLs are not duplicated on a second pass.
+        self.assertEqual(module.high_tier_rows(self.state, seen), [])
+
+    def test_review_polling_thread_starts_once(self):
+        started = []
+        with mock.patch.object(review_intake.threading, 'Thread',
+                               lambda **kw: started.append(1) or mock.Mock()):
+            review_intake.start(self.state)
+            review_intake.start(self.state)
+        self.assertEqual(len(started), 1)
 
 
 if __name__ == '__main__':

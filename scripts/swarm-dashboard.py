@@ -15,6 +15,7 @@ The page auto-refreshes every 10 seconds. Everything binds to 127.0.0.1 only.
 """
 import argparse
 from priority_dashboard import render as priority_section
+import priority_schedule
 import review_intake
 import html
 import json
@@ -818,7 +819,7 @@ def build_page(base=None):
   </div>
 </header>
 {review_intake.render(read_json(STATE / 'review-intake.json'))}
-{priority_section(read_json(STATE / 'priority-snapshot.json'), list(queue_entries.values()), live_workers, claims, owners, (STATE / 'stop-dispatch').exists() or runtime.get('status') == 'stopped')}
+{priority_section(priority_schedule.merged_snapshot(STATE), list(queue_entries.values()), live_workers, claims, owners, (STATE / 'stop-dispatch').exists() or runtime.get('status') == 'stopped')}
 <section>
   <h2>Coordinator</h2>
   <div class="card {pulse(coord["last_ts"])}">

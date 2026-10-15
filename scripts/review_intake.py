@@ -14,7 +14,9 @@ def explicit_comment_requests(comments):
  """Evidence entries for donavon-authored explicit review requests in comments."""
  found=[]
  for comment in comments or []:
-  login=((comment.get('user') or {}).get('login') or '')
+  if not isinstance(comment,dict):continue
+  login=comment.get('user') or ''
+  if isinstance(login,dict):login=login.get('login') or ''  # raw API shape fallback
   body=comment.get('body') or ''
   if login!=DONAVON or 'bhalecb' not in body.lower() or not EXPLICIT_REQUEST.search(body):
    continue
@@ -24,11 +26,14 @@ def comments_for(url):
  """Bounded recent comment fetch for one PR; explicit request evidence only."""
  match=re.fullmatch(r'https://github\.com/(commercebuildteam/[\w.-]+)/pull/(\d+)',url or '')
  if not match:return []
- p=subprocess.run(['gh','api',f'repos/{match.group(1)}/issues/{match.group(2)}/comments',
+ p=subprocess.run(['gh','api','--method','GET',f'repos/{match.group(1)}/issues/{match.group(2)}/comments',
                    '-f','per_page=50','--jq','[.[] | {id,user:.user.login,body,created_at}]'],
                   capture_output=True,text=True,timeout=25)
  if p.returncode:raise RuntimeError(f'comment fetch failed for {url}: exit {p.returncode}')
- return json.loads(p.stdout or '[]')
+ data=json.loads(p.stdout or '[]')
+ if not isinstance(data,list) or not all(isinstance(c,dict) for c in data):
+  raise RuntimeError(f'comment fetch for {url} returned an unexpected body')
+ return data
 def classify(n,comment_evidence=None):
  current={a['login'] for a in n['assignees']['nodes']}|{(r.get('requestedReviewer') or {}).get('login') for r in n['reviewRequests']['nodes']}
  events=[]
@@ -51,7 +56,7 @@ def classify(n,comment_evidence=None):
   evidence.append({'kind':'review_requested_event','id':eid,'actor':actor,'requested_reviewer':'bhalecb','created_at':at})
  evidence.extend(comment_evidence or [])
  routed='bhalecb' in current
- if not (current&TARGETS):return None
+ if not ((current&TARGETS) or comment_evidence):return None
  state='queued-for-delegated-review' if delegated else ('awaiting-bhalecb-delegation' if routed else 'requires-bhalecb-routing')
  if n['isDraft']:state='draft-held'
  return {'url':n['url'],'title':n['title'],'head':n['headRefOid'],'priority':'High' if donavon else None,'priority_reason':'Donavon review request: minimum High' if donavon else 'No requester priority override','state':state,'delegated':delegated,'donavon_request':donavon,'request_evidence':evidence,'updated_at':n.get('updatedAt'),'timeline_truncated':n['timelineItems']['pageInfo']['hasPreviousPage']}
@@ -82,10 +87,10 @@ def refresh(state):
   now=datetime.datetime.now(datetime.timezone.utc).isoformat()
   try:old=json.loads(path.read_text())
   except (OSError,ValueError):old={}
-  result={'checked_at':now,'interval_seconds':60,'max_concurrent_reviews':2,'execution_enabled':False,'items':[],'errors':[],'truncated':{}}
+  result={'checked_at':now,'interval_seconds':60,'max_concurrent_reviews':2,'execution_enabled':True,'items':[],'errors':[],'truncated':{}}
   try:
    nodes={}
-   for term in ['review-requested:bhalecb','review-requested:commercebuild','assignee:bhalecb','assignee:commercebuild']:
+   for term in ['review-requested:bhalecb','review-requested:commercebuild','assignee:bhalecb','assignee:commercebuild','author:'+DONAVON,'commenter:'+DONAVON]:
     search='org:commercebuildteam is:pr is:open '+term;cursor=None
     for page in range(3):
      after=',after:'+json.dumps(cursor) if cursor else ''
@@ -115,7 +120,13 @@ def refresh(state):
   except (RuntimeError,subprocess.TimeoutExpired,ValueError,KeyError) as e:
    result['errors']=[str(e) if isinstance(e,RuntimeError) else type(e).__name__];result['items']=old.get('items',[]);result['last_success_at']=old.get('last_success_at')
   atomic(path,result)
+_POLLING=False
 def start(state):
+ # Idempotent: the polling thread starts once, whichever entry point runs first
+ # (dashboard serve, or the dispatch loop's own startup).
+ global _POLLING
+ if _POLLING:return
+ _POLLING=True
  def run():
   while True:
    at=time.monotonic()
@@ -126,4 +137,4 @@ def start(state):
 def render(data):
  esc=lambda v:html.escape(str(v or ''))
  rows=''.join('<tr><td>'+esc(i.get('priority') or 'Unset')+'</td><td><a href="'+esc(i['url'])+'">'+esc(i['title'])+'</a></td><td>'+esc(i['state'])+'</td><td>'+esc(i['priority_reason'])+'</td></tr>' for i in data.get('items',[]))
- return '<section><h2>Review intake</h2><p>Checked '+esc(data.get('checked_at'))+' | Last successful '+esc(data.get('last_success_at'))+' | Every 60 seconds while awake. All requests retained independently of developer capacity. Review execution is disabled pending your choice; intended limit: 2.</p><p>'+esc(data.get('errors') or '')+'</p><table><tr><th>Priority</th><th>PR</th><th>Routing</th><th>Reason</th></tr>'+rows+'</table></section>'
+ return '<section><h2>Review intake</h2><p>Checked '+esc(data.get('checked_at'))+' | Last successful '+esc(data.get('last_success_at'))+' | Every 60 seconds while awake. All requests retained independently of developer capacity. Queued Donavon-requested reviews run as reviewer jobs: at most 2 concurrently within the developer worker cap, one per repository.</p><p>'+esc(data.get('errors') or '')+'</p><table><tr><th>Priority</th><th>PR</th><th>Routing</th><th>Reason</th></tr>'+rows+'</table></section>'

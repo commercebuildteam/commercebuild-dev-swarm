@@ -1,6 +1,7 @@
 """Minute refresh and stable priority ordering; never modifies running work."""
 import json,threading,time
 import promotion_source
+import review_intake
 from priority_source import collect,RANK
 _lock=threading.Lock()
 _last=0.0
@@ -34,13 +35,25 @@ def rank_map(state):
  items=merge_items(state)
  return {x['url']:RANK.get(x.get('priority'),5) for x in items}
 
+def merged_snapshot(state):
+ """Full scheduling evidence: ticket snapshot plus Donavon-requested reviews and
+ promotion rows, so the dashboard and ordering both see every tier."""
+ data=dict(snapshot(state))
+ rows={x['url']:x for x in data.get('items') or []}
+ try:
+  reviews={i['url']:i for i in review_intake.snapshot(state).get('items',[]) if i.get('donavon_request')}
+ except (OSError,ValueError):pass
+ else:
+  for url,item in reviews.items():
+   # The review request supplies the High floor when no ticket priority exists.
+   if (rows.get(url) or {}).get('priority') in (None,''):rows[url]=item
+ # Promotion evidence supersedes everything for its URL: promotions outrank all.
+ rows.update({i['url']:i for i in promotion_source.items(state)})
+ data['items']=list(rows.values())
+ return data
+
 def merge_items(state):
- # Promotion evidence is merged into ordering; a URL already carrying a ticket
- # priority is superseded by its promotion classification (promotions outrank all).
- base={x['url']:x for x in snapshot(state).get('items',[])}
- for promo in promotion_source.items(state):
-  base[promo['url']]=promo
- return list(base.values())
+ return merged_snapshot(state)['items']
 
 def order(rows,state):
  ranks=rank_map(state)
