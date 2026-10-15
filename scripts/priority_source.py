@@ -19,7 +19,7 @@ def collect(base):
  if path.exists():
   old=json.loads(path.read_text())
   if (now-datetime.datetime.fromisoformat(old['captured_at'])).total_seconds()<60:return old
- result={'captured_at':now.isoformat(),'scope':'Open assigned commercebuild issues and open commercebuild- or donavon-commercebuild-authored PRs plus any PR requested for bhalecb or commercebuild review; maximum 300 each. Linked issues may be assigned to another owner. Evidence only.','items':[],'errors':[],'truncated':{}}
+ result={'captured_at':now.isoformat(),'scope':'Open assigned commercebuild issues and open PRs by commercebuild or donavon-commercebuild, plus any PR requested for bhalecb or commercebuild review or commented on by donavon-commercebuild; maximum 300 each. Linked issues may be assigned to another owner. Evidence only.','items':[],'errors':[],'truncated':{}}
  issues={};prs=[]
  try:
   for kind,search,fragment in [
@@ -29,7 +29,10 @@ def collect(base):
    # A Donavon-requested review can be authored by anyone; PRs requested for review
    # carry linked-ticket priority regardless of author.
    ('prs','org:commercebuildteam is:pr is:open review-requested:bhalecb','... on PullRequest{url title body reviewDecision isDraft closingIssuesReferences(first:20){nodes{url '+FIELDS+' '+LABELS+'}}}'),
-   ('prs','org:commercebuildteam is:pr is:open review-requested:commercebuild','... on PullRequest{url title body reviewDecision isDraft closingIssuesReferences(first:20){nodes{url '+FIELDS+' '+LABELS+'}}}')]:
+   ('prs','org:commercebuildteam is:pr is:open review-requested:commercebuild','... on PullRequest{url title body reviewDecision isDraft closingIssuesReferences(first:20){nodes{url '+FIELDS+' '+LABELS+'}}}'),
+   # A comment-only Donavon request can sit on a PR by another author that never
+   # received a review request; those PRs must still reach their linked priority.
+   ('prs','org:commercebuildteam is:pr is:open commenter:donavon-commercebuild','... on PullRequest{url title body reviewDecision isDraft closingIssuesReferences(first:20){nodes{url '+FIELDS+' '+LABELS+'}}}')]:
    cursor=None
    for page in range(3):
     after=',after:'+json.dumps(cursor) if cursor else ''

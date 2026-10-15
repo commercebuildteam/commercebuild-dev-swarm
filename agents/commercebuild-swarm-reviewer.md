@@ -27,6 +27,11 @@ promotion PRs whose next owner is bhalecb.
 4. Return a structured checkpoint: head SHA, commands run with results, PR
    URL, findings, and the exact next action with its owner.
 
-Identity note: the launcher process authenticates as `commercebuild`; review
-comments posted by a dispatched reviewer job come from that account. Approval
-always remains a bhalecb action and is never performed by this agent.
+Identity and completion proof: the launcher process authenticates as
+`commercebuild`; review findings posted by a dispatched reviewer job come from
+that account, and that is the job's recorded completion evidence
+(a reviewer comment or review on the PR's current head during the run).
+It is never a substitute for bhalecb's formal review: approval, merge, and the
+final review verdict remain bhalecb's actions through his own account, and the
+job's checkpoint must say so. Retries of a reviewer job run under this same
+reviewer agent, never the developer agent.

@@ -691,7 +691,11 @@ def freshness_loop(stop, interval=60):
         errors, seconds = {}, {}
         for name, task in (('priority', lambda: priority_schedule.refresh(STATE, background=False)),
                            ('promotions', lambda: promotion_source.collect(STATE)),
-                           ('review_intake', lambda: review_intake.refresh(STATE))):
+                           ('review_intake', lambda: review_intake.refresh(STATE)),
+                           # The poller also inserts newly discovered requests into the
+                           # durable pending queue, so a request arriving during a long
+                           # full pool never waits for a free slot to become visible.
+                           ('queue_intake', lambda: record_high_tier(None))):
             began = time.monotonic()
             try:
                 task()
@@ -919,10 +923,67 @@ def approved_on_head(url, head):
     return review.get('state') == 'APPROVED' and review.get('commit_id') == head
 
 
+def review_posted_on_head(url, head, since):
+    """Completion proof for a dispatched reviewer job: a review or comment by the
+    reviewer execution account on the PR's current head during this run. An
+    existing bhalecb review request proves nothing about whether the review ran."""
+    match = TICKET_RE.match(url or '')
+    if not match:
+        return False
+    repo, number = match.group(1), match.group(2)
+    checks = [
+        ['gh', 'api', f'repos/{repo}/pulls/{number}/reviews', '--jq',
+         '[.[] | select(.user.login == "commercebuild") | {commit_id, submitted_at}]'],
+        ['gh', 'api', f'repos/{repo}/issues/{number}/comments', '--jq',
+         '[.[] | select(.user.login == "commercebuild") | {submitted_at: .created_at}]'],
+    ]
+    for command in checks:
+        try:
+            result = subprocess.run(command, check=True, capture_output=True, text=True, timeout=30)
+            rows = json.loads(result.stdout or '[]')
+        except Exception:
+            continue
+        for row in rows or []:
+            at = parse_ts(row.get('submitted_at'))
+            if not since or not at or at < since:
+                continue
+            if row.get('commit_id') in (None, head):
+                return True
+    return False
+
+
+def verify_review_completion(entry, checkpoint, started_at):
+    """Reviewer jobs settle on their own evidence, never the developer rules: the
+    run is complete when the reviewer path posted findings on the PR head during
+    this run, and the formal approval always remains bhalecb's decision."""
+    repo = (entry.get('repo') or '').lower()
+    ticket = entry.get('issue') or ''
+    since = parse_ts(started_at)
+    candidates = [u for u in re.findall(r'https://github\.com/commercebuildteam/[^/\s]+/pull/\d+', checkpoint or '')
+                  if u.lower().startswith('https://github.com/' + repo + '/')]
+    if '/pull/' in ticket and ticket not in candidates:
+        candidates.insert(0, ticket)
+    for url in dict.fromkeys(candidates):
+        try:
+            result = subprocess.run(['gh', 'pr', 'view', url, '--json', 'state,headRefOid'],
+                                    check=True, capture_output=True, text=True, timeout=30)
+            pr = json.loads(result.stdout)
+        except Exception as exc:
+            return 'incomplete', f'{url}: {type(exc).__name__}: could not read PR state'
+        if pr.get('state') != 'OPEN':
+            return 'incomplete', f'{url}: {pr.get("state")}'
+        if review_posted_on_head(url, pr.get('headRefOid'), since):
+            return 'completed', (f'{url} head {str(pr.get("headRefOid"))[:8]} has reviewer findings '
+                                 'posted on this head; formal approval and merge remain bhalecb\'s decision')
+    return 'incomplete', 'no reviewer findings were posted during this run'
+
+
 def settle_status(entry, checkpoint, started_at):
     """GitHub evidence outranks the worker's text: a PR with changes and a review request
     is complete whatever the checkpoint says; otherwise a deliberate stop (scope gate,
     hand-back) is blocked, and anything else is incomplete."""
+    if entry.get('kind') == 'review':
+        return verify_review_completion(entry, checkpoint, started_at)
     status, verdict = verify_completion(entry, checkpoint, started_at)
     if status in ('completed', 'awaiting-merge', 'awaiting-review', 'awaiting-assessment'):
         return status, verdict
@@ -1298,7 +1359,11 @@ def run_entry(args, model, session, item):
             if (checkpoint or '').strip():
                 retry_prompt += (f'\n\nPREVIOUS ATTEMPT (ended {status}) last output; continue from it '
                                  f'rather than starting over:\n{checkpoint.strip()[-PRIOR_CHECKPOINT_CHARS:]}\n')
-            status, worker_session, checkpoint = run_worker(args, model, worker_id, retry_prompt, 2)
+            # Retries keep the entry's own agent: a review-tier item never falls back
+            # to the developer agent on its second attempt.
+            retry_agent = agent_for_entry(entry)
+            status, worker_session, checkpoint = run_worker(args, model, worker_id, retry_prompt, 2,
+                                                            agent=retry_agent)
             execution_status = status
             if status == 'completed':
                 status, verdict = settle_status(entry, checkpoint, started_at)
@@ -1418,8 +1483,12 @@ def dispatch_round(args, model, session):
                                 if i.get('donavon_request')}
                 running_reviews = sum(1 for e in read_queue()
                                       if e.get('state') == 'running' and e.get('issue') in donavon_urls)
+                round_repos = set()  # one worker per repository within this pass
                 for entry in pending:
                     if active >= SLOTS or time.time() < QUOTA_PAUSE_UNTIL[0]:
+                        waiting += 1
+                        continue
+                    if entry.get('repo') in round_repos:
                         waiting += 1
                         continue
                     if not review_intake.can_dispatch(entry.get('issue'), donavon_urls, running_reviews):
@@ -1436,6 +1505,7 @@ def dispatch_round(args, model, session):
                         continue
                     known.add(entry_key(entry))
                     claim_logged.discard(worker_id)
+                    round_repos.add(entry.get('repo'))
                     if entry.get('issue') in donavon_urls:
                         running_reviews += 1
                     futures[pool.submit(run_entry, args, model, session, item)] = worker_id
@@ -1913,14 +1983,15 @@ def record_high_tier(session):
     re-discovery. No claim is taken here: prepare_entry claims at dispatch time.
     """
     existing = read_queue()
-    busy_repos = {e.get('repo') for e in existing if e.get('state') in ('pending', 'running')}
     busy_workers = {e.get('worker_id') for e in existing if e.get('state') in ('pending', 'running')}
     queued_urls = {e.get('issue') for e in existing}
-    archived = archived_repos()
     candidates = [i for i in review_intake.snapshot(STATE).get('items', [])
                   if i.get('donavon_request')]
     candidates += [i for i in promotion_source.items(STATE)
                    if i.get('next_owner') == 'bhalecb']
+    # Every qualifying request is recorded; one worker per repository is enforced
+    # at dispatch time, not by hiding pending requests here.
+    archived = archived_repos() if candidates else set()
     recorded = []
     for item in candidates:
         url = item.get('url') or ''
@@ -1928,7 +1999,7 @@ def record_high_tier(session):
             continue
         repo = '/'.join(url.split('/')[3:5]).lower()
         worker_id = worker_id_for(url)
-        if not repo or not worker_id or repo in busy_repos or worker_id in busy_workers \
+        if not repo or not worker_id or worker_id in busy_workers \
                 or repo in archived:
             continue
         write_prompt(worker_id, repo, url, item.get('title') or '', mode='review')
@@ -1944,7 +2015,6 @@ def record_high_tier(session):
                      'state': 'pending', 'updated_at': stamp(), 'kind': 'review'}] + kept
         update_queue(mutate)
         queued_urls.add(url)
-        busy_repos.add(repo)
         busy_workers.add(worker_id)
         recorded.append({'worker_id': worker_id, 'url': url})
     if recorded:
@@ -2083,12 +2153,13 @@ def direct_intake(session, limit=SLOTS, assignee=DEFAULT_ASSIGNEE):
                 continue
             item['updatedAt'] = current.get('updatedAt') or item.get('updatedAt')
         repositories.add(repo)
-        selected.append((repo, url, item.get('title') or '', worker_id, item.get('updatedAt') or '', note, owed_head, item.get('routing_sources') or []))
+        selected.append((repo, url, item.get('title') or '', worker_id, item.get('updatedAt') or '', note,
+                         owed_head, item.get('routing_sources') or [], item.get('kind') or 'developer'))
         if len(selected) >= limit:
             break
 
     new_entries = []
-    for repo, url, title, worker_id, updated_at, note, owed_head, routing_sources in selected:
+    for repo, url, title, worker_id, updated_at, note, owed_head, routing_sources, kind in selected:
         try:
             claim = update_claim(argparse.Namespace(command='claim', session=session, repo=repo, issue=url))
             update_claim(argparse.Namespace(command='bind', session=session, claim=claim['id'], worker=worker_id))
@@ -2096,11 +2167,11 @@ def direct_intake(session, limit=SLOTS, assignee=DEFAULT_ASSIGNEE):
             log(f'intake: cannot claim {repo} ({exc}); stopping this pass')
             break
         prompt_path = write_prompt(worker_id, repo, url, title, note,
-                                   mode='review' if item.get('kind') == 'review' else 'developer')
+                                   mode='review' if kind == 'review' else 'developer')
         new_entries.append({'worker_id': worker_id, 'repo': repo, 'issue': url, 'owed': note or None, 'owed_head': owed_head,
                             'claim_id': claim['id'], 'prompt_file': prompt_path.name,
                             'issue_updated_at': updated_at, 'routing_sources': routing_sources,
-                            'kind': item.get('kind') or 'developer',
+                            'kind': kind,
                             'state': 'pending', 'updated_at': stamp()})
     if new_entries:
         new_ids = {e['worker_id'] for e in new_entries}

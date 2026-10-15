@@ -7,7 +7,12 @@ TARGETS={'bhalecb','commercebuild'}
 EXPLICIT_REQUEST=re.compile(r'(?i)\b(?:please\s+|kindly\s+|can\s+you\s+|could\s+you\s+|request(?:ing|ed)?\s+(?:a\s+)?)review\b')
 COMMENT_SCAN_BUDGET=25
 ISSUE_SCAN_BUDGET=25
-FRAGMENT='''... on PullRequest { url title updatedAt headRefOid isDraft author{login}
+# Linked issues beyond the closing references: full URLs and bare #N references
+# in the PR body are also explicit links whose comments must be scanned.
+BODY_REF_URL=re.compile(r'(?i)commercebuildteam/([\w.\-]+)/issues/(\d+)')
+BODY_REF_NUM=re.compile(r'(?<![\w/])#(\d+)\b')
+LABEL_PRIORITY=re.compile(r'^(?:p(?:riority)?[:_ -]*)?(urgent|high|medium|low)$',re.I)
+FRAGMENT='''... on PullRequest { url title body updatedAt headRefOid isDraft author{login}
  assignees(first:30){nodes{login}} reviewRequests(first:30){nodes{requestedReviewer{... on User{login}}}}
  closingIssuesReferences(first:20){nodes{url}}
  timelineItems(last:100,itemTypes:[REVIEW_REQUESTED_EVENT]){pageInfo{hasPreviousPage} nodes{
@@ -36,6 +41,29 @@ def comments_for(url):
  if not isinstance(data,list) or not all(isinstance(c,dict) for c in data):
   raise RuntimeError(f'comment fetch for {url} returned an unexpected body')
  return data
+def linked_issue_urls(node):
+    """Verified linked issues for one PR: closing references plus explicit links
+    parsed from the PR body (full URLs and bare #N references)."""
+    urls=[(r.get('url') or '') for r in (node.get('closingIssuesReferences') or {}).get('nodes') or []]
+    repo_base=(node.get('url') or '').rsplit('/pull/',1)[0]
+    body=node.get('body') or ''
+    for m in BODY_REF_URL.finditer(body):
+        urls.append(f'https://github.com/commercebuildteam/{m.group(1)}/issues/{m.group(2)}')
+    for m in BODY_REF_NUM.finditer(body):
+        if repo_base:urls.append(f'{repo_base}/issues/{m.group(1)}')
+    return [u for u in dict.fromkeys(urls) if re.fullmatch(r'https://github\.com/commercebuildteam/[\w.-]+/issues/\d+',u or '')]
+def issue_priority(url):
+    """Current priority of one linked issue from its own labels, independent of
+    the coordinator's priority snapshot."""
+    match=re.fullmatch(r'https://github\.com/(commercebuildteam/[\w.-]+)/issues/(\d+)',url or '')
+    if not match:return None
+    p=subprocess.run(['gh','api','--method','GET',f'repos/{match.group(1)}/issues/{match.group(2)}',
+                      '--jq','[.labels[].name]'],capture_output=True,text=True,timeout=25)
+    if p.returncode:return None
+    for name in json.loads(p.stdout or '[]'):
+        m=LABEL_PRIORITY.match(name or '')
+        if m:return m.group(1).capitalize()
+    return None
 def classify(n,comment_evidence=None):
  current={a['login'] for a in n['assignees']['nodes']}|{(r.get('requestedReviewer') or {}).get('login') for r in n['reviewRequests']['nodes']}
  events=[]
@@ -113,17 +141,26 @@ def refresh(state):
      except (RuntimeError,subprocess.TimeoutExpired,ValueError) as ce:
       result['errors'].append(str(ce) if isinstance(ce,RuntimeError) else type(ce).__name__)
     # Explicit requests can live in verified linked issues, not only PR comments.
-    for issue_ref in (n.get('closingIssuesReferences') or {}).get('nodes') or []:
-     issue_url=(issue_ref or {}).get('url') or ''
-     if not issue_url or issue_budget<=0:continue
+    # Closing references and explicit body links (including non-closing issues)
+    # are both required sources, and each linked issue also carries its own
+    # current ticket priority.
+    linked_issue_priorities=[]
+    for issue_url in linked_issue_urls(n):
+     if issue_budget<=0:break
      issue_budget-=1
      try:comment_evidence.extend(explicit_comment_requests(comments_for(issue_url)))
      except (RuntimeError,subprocess.TimeoutExpired,ValueError) as ce:
       result['errors'].append(str(ce) if isinstance(ce,RuntimeError) else type(ce).__name__)
+     try:
+      priority=issue_priority(issue_url)
+     except (subprocess.TimeoutExpired,ValueError) as pe:
+      result['errors'].append(type(pe).__name__);priority=None
+     if priority:linked_issue_priorities.append(priority)
     item=classify(n,comment_evidence)
     if item:
-     native=priorities.get(item['url'])
-     if ranks.get(native,9)<ranks.get(item['priority'],9):item['priority']=native;item['priority_reason']='Linked issue priority'
+     native=[priorities.get(item['url'])]+linked_issue_priorities
+     best=min([p for p in native if p],key=lambda p:ranks.get(p,9),default=None)
+     if ranks.get(best,9)<ranks.get(item['priority'],9):item['priority']=best;item['priority_reason']='Linked issue priority'
      result['items'].append(item)
    result['items'].sort(key=lambda i:(ranks.get(i['priority'],9),i['updated_at'],i['url']))
    result['last_success_at']=now

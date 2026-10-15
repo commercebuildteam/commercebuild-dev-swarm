@@ -11,11 +11,19 @@ import json
 import pathlib
 import re
 import subprocess
+import time
+from concurrent.futures import ThreadPoolExecutor, wait
 
 RANK = {'Promotion': 0}
 REFRESH_SECONDS = 60
-MAX_SEARCH_PAGES = 3
-MAX_DETAIL_PER_REFRESH = 40
+MAX_SEARCH_PAGES = 10
+# Each refresh verifies this many candidates, in parallel; the rotation reaches the
+# rest of the open-PR list on later refreshes, and unexamined candidates stay
+# marked in the snapshot so an unknown promotion can never silently lose priority.
+MAX_DETAIL_PER_REFRESH = 200
+DETAIL_WORKERS = 8
+# Bounded sweep deadline per refresh; past it, remaining candidates are deferred.
+DISCOVERY_SECONDS = 90
 
 # A promotion PR targets a release or stable branch. Both channels take precedence.
 PROMO_TARGET = re.compile(r'^(release(?:/.+)?|stable(?:/.+)?)$', re.IGNORECASE)
@@ -28,7 +36,8 @@ ENCODED_HEAD = re.compile(r'%[0-9a-fA-F]{2}|[A-Za-z0-9]+-[0-9a-f]{8,}', re.IGNOR
 REPLACEMENT = re.compile(r'replacement', re.IGNORECASE)
 # A promotion records its source in the prepared PR body; without a promotion
 # workflow, a recorded source SHA plus an existing source branch is the lineage.
-SOURCE_RECORD = re.compile(r'(?i)source[:\s`]+([0-9a-f]{7,40})')
+SOURCE_RECORD = re.compile(r'(?i)source[:\s`]+([0-9a-f]{40})\b')
+RELEASE_REF = re.compile(r'(?i)/releases/tag/([\w.\-]+)')
 WORKFLOW_PATH = '.github/workflows/promotion-prepare.yml'
 # Title words only prioritize which candidates are verified first within the
 # per-refresh budget; branch structure verification alone classifies, and the
@@ -116,37 +125,74 @@ def branch_evidence(detail):
             'head_repo': head_repo, 'verified': verified}
 
 
-def has_promotion_workflow(repo, cache):
-    """Cached per-refresh workflow check; the prepared snapshot proves lineage.
-    Existence only: the presence of the promotion workflow file is the evidence."""
-    if repo in cache:
-        return cache[repo]
-    result = subprocess.run(['gh', 'api', 'repos/' + repo + '/contents/' + WORKFLOW_PATH,
-                             '--jq', '.name'], capture_output=True, text=True, timeout=25)
-    cache[repo] = result.returncode == 0
-    return cache[repo]
+def promotion_workflow_run(repo, head_sha, cache):
+    """A promotion-prepare workflow run for this exact PR head ties the PR to a
+    machine-prepared source snapshot. The workflow file merely existing in the
+    repository proves nothing about this PR, so lineage requires a run whose
+    head commit is this PR's head."""
+    key = (repo, head_sha)
+    if key in cache:
+        return cache[key]
+    verified = None
+    result = subprocess.run(
+        ['gh', 'api', '--method', 'GET', 'repos/' + repo + '/actions/runs',
+         '-f', 'per_page=20', '--jq',
+         '[.workflow_runs[] | select(.path == "' + WORKFLOW_PATH + '") | {id, head_sha, head_branch}]'],
+        capture_output=True, text=True, timeout=25)
+    if result.returncode == 0:
+        try:
+            runs = json.loads(result.stdout or '[]')
+        except ValueError:
+            runs = []
+        run = next((r for r in runs if r.get('head_sha') == head_sha), None)
+        if run:
+            verified = {'kind': 'promotion-workflow-run', 'run_id': run.get('id'),
+                        'head_branch': run.get('head_branch'), 'verified': True}
+    cache[key] = verified
+    return verified
+
+
+def source_branch_ancestor(repo, sha, branch):
+    """The recorded source SHA is on the source branch: identical to its head or
+    an ancestor of it (the branch may have moved after the promotion was prepared)."""
+    result = subprocess.run(
+        ['gh', 'api', f'repos/{repo}/compare/{sha}...{branch}', '--jq', '.status'],
+        capture_output=True, text=True, timeout=25)
+    if result.returncode:
+        return False
+    return (result.stdout or '').strip().strip('"') in ('identical', 'ahead')
+
+
+def release_evidence(repo, body):
+    """A linked GitHub release in the PR body verifies when the tag exists."""
+    match = RELEASE_REF.search(body or '')
+    if not match:
+        return None
+    result = subprocess.run(['gh', 'api', 'repos/' + repo + '/releases/tags/' + match.group(1),
+                             '--jq', '.tag_name'], capture_output=True, text=True, timeout=25)
+    if result.returncode:
+        return None
+    return {'kind': 'linked-release', 'tag': match.group(1), 'verified': True}
 
 
 def lineage_evidence(repo, detail, cache):
     """Verified promotion lineage beyond naming and a head commit.
 
-    A repository promotion workflow proves the promotion was machine-prepared.
-    Without one, a recorded source SHA in the PR body plus an existing source
-    branch is the lineage. Anything less is an unverified candidate.
+    Three PR-specific proofs, in order of strength: a promotion-prepare workflow
+    run for this PR's head commit; a recorded source SHA verifiably on a source
+    branch; or a linked release whose tag exists. Anything less is an unverified
+    candidate and is never ranked.
     """
-    if has_promotion_workflow(repo, cache):
-        return {'kind': 'promotion-workflow', 'workflow': WORKFLOW_PATH, 'verified': True}
+    head_sha = (detail.get('sha') or '').strip()
+    if head_sha and promotion_workflow_run(repo, head_sha, cache):
+        return promotion_workflow_run(repo, head_sha, cache)
     record = SOURCE_RECORD.search(detail.get('body') or '')
-    if not record:
-        return None
-    for branch in ('master', 'main'):
-        result = subprocess.run(['gh', 'api', 'repos/' + repo + '/branches/' + branch,
-                                 '--jq', '.name'], capture_output=True, text=True, timeout=25)
-        if result.returncode:
-            continue
-        return {'kind': 'source-record', 'source_sha': record.group(1),
-                'source_branch': branch, 'verified': True}
-    return None
+    if record and re.fullmatch(r'[0-9a-f]{40}', record.group(1)):
+        for branch in ('master', 'main'):
+            if source_branch_ancestor(repo, record.group(1), branch):
+                return {'kind': 'source-record', 'source_sha': record.group(1),
+                        'source_branch': branch, 'verified': True}
+    return release_evidence(repo, detail.get('body') or '')
 
 
 def classify(detail):
@@ -221,38 +267,56 @@ def collect(state):
         queue = [r for r in ordered if r['url'] in likely] + \
                 [r for r in ordered if r['url'] not in likely]
         fresh, examined = [], set()
-        workflow_cache = {r: True for r in (old.get('workflow_repos') or [])
-                          if isinstance(r, str)}
-        detail_budget = MAX_DETAIL_PER_REFRESH
-        for row in queue:
-            # No title filter here: a custom or replacement promotion may not carry
-            # the keywords. Branch structure verification decides classification.
-            if detail_budget <= 0:
-                break
-            detail_budget -= 1
-            examined.add(row['url'])
-            try:
-                detail = pr_detail(row['repo'], row['number'])
-                detail.update({'url': row['url'], 'updatedAt': row['updatedAt'],
-                               'verified_at': now.isoformat()})
-                item = classify(detail)
-            except (subprocess.SubprocessError, ValueError, OSError, KeyError) as exc:
-                result['errors'].append(f'{row["url"]}: {type(exc).__name__}')
-                continue
-            if item:
-                # Branch structure alone is naming: verify the promotion lineage
-                # (workflow, or recorded source SHA plus an existing source branch)
-                # before ranking. Unverified candidates stay visible, never ranked.
-                try:
-                    lineage = lineage_evidence(row['repo'], detail, workflow_cache)
-                except (subprocess.SubprocessError, OSError, ValueError):
-                    lineage = None
-                if not lineage or not lineage.get('verified'):
-                    result['unverified'][row['url']] = 'promotion lineage unverified: no promotion workflow and no recorded source branch/SHA'
-                    continue
-                item['lineage'] = lineage
-                fresh = [i for i in fresh if i['url'] != item['url']]
-                fresh.append(item)
+        lineage_cache = {}
+        for key, value in (old.get('lineage_cache') or {}).items():
+            repo_key, _, sha_key = str(key).partition('|')
+            if repo_key and sha_key and isinstance(value, dict):
+                lineage_cache[(repo_key, sha_key)] = value
+        queue = queue[:MAX_DETAIL_PER_REFRESH]
+        candidates_total = len(ordered)
+
+        def verify(row):
+            """Detail, classification, and lineage for one candidate."""
+            detail = pr_detail(row['repo'], row['number'])
+            detail.update({'url': row['url'], 'updatedAt': row['updatedAt'],
+                           'verified_at': now.isoformat()})
+            item = classify(detail)
+            if not item:
+                return row, detail, item, None
+            return row, detail, item, lineage_evidence(row['repo'], detail, lineage_cache)
+
+        results, failed, unverified = {}, {}, {}
+        deadline = time.monotonic() + DISCOVERY_SECONDS
+        with ThreadPoolExecutor(max_workers=DETAIL_WORKERS) as pool:
+            futures = {pool.submit(verify, row): row for row in queue}
+            pending = set(futures)
+            while pending and time.monotonic() < deadline:
+                done, pending = wait(pending, timeout=1)
+                for future in done:
+                    row = futures[future]
+                    examined.add(row['url'])
+                    try:
+                        _, detail, item, lineage = future.result()
+                    except (subprocess.SubprocessError, ValueError, OSError, KeyError) as exc:
+                        failed[row['url']] = f'{row["url"]}: {type(exc).__name__}'
+                        continue
+                    if not item:
+                        continue
+                    if not lineage or not lineage.get('verified'):
+                        unverified[row['url']] = ('promotion lineage unverified: no promotion '
+                                                  'workflow run, no source branch/SHA record, '
+                                                  'and no linked release')
+                        continue
+                    item['lineage'] = lineage
+                    fresh = [i for i in fresh if i['url'] != item['url']]
+                    fresh.append(item)
+            # Past the deadline, cancel outstanding verifications: those candidates stay
+            # marked unverified so they are never silently unprioritized.
+            for future in pending:
+                future.cancel()
+            for row in futures.values():
+                if row['url'] not in examined:
+                    unverified[row['url']] = 'detail verification deferred to a later refresh'
         fresh_urls = {i['url'] for i in fresh}
         # Rebuild from live search: a merged or closed promotion disappears instead
         # of ranking forever. Still-open items this refresh could not verify stay
@@ -261,11 +325,11 @@ def collect(state):
                 if i['url'] in open_urls and i['url'] not in fresh_urls
                 and i['url'] not in examined and i.get('lineage', {}).get('verified')]
         result['items'] = fresh + kept
-        result['unverified'].update({row['url']: 'detail verification deferred to a later refresh'
-                                     for row in queue if row['url'] not in examined})
-        result['truncated'] = detail_budget <= 0 and len(queue) > len(examined)
+        result['errors'].extend(failed.values())
+        result['unverified'].update(unverified)
+        result['truncated'] = len(examined) < candidates_total
         result['cursor'] = (start + len(examined)) % len(rows) if rows else 0
-        result['workflow_repos'] = sorted(r for r, v in workflow_cache.items() if v)
+        result['lineage_cache'] = {f'{r}|{s}': v for (r, s), v in lineage_cache.items() if v}
     except (subprocess.SubprocessError, RuntimeError, ValueError, OSError) as exc:
         result['errors'].append(str(exc) if isinstance(exc, RuntimeError) else type(exc).__name__)
         # Rate limiting and permission failures keep last-known items visible.
