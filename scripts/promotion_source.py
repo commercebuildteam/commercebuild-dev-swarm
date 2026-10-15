@@ -23,7 +23,9 @@ MAX_SEARCH_PAGES = 10
 MAX_DETAIL_PER_REFRESH = 200
 DETAIL_WORKERS = 8
 # Bounded sweep deadline per refresh; past it, remaining candidates are deferred.
-DISCOVERY_SECONDS = 90
+# The whole refresh (search plus sweep) must finish inside the 60-second intake
+# requirement, so the sweep deadline stays below the refresh interval.
+DISCOVERY_SECONDS = 45
 
 # A promotion PR targets a release or stable branch. Both channels take precedence.
 PROMO_TARGET = re.compile(r'^(release(?:/.+)?|stable(?:/.+)?)$', re.IGNORECASE)
@@ -35,7 +37,8 @@ PREPARED_HEAD = re.compile(r'^(cb-promotion|promotion-prepare|promote)', re.IGNO
 ENCODED_HEAD = re.compile(r'%[0-9a-fA-F]{2}|[A-Za-z0-9]+-[0-9a-f]{8,}', re.IGNORECASE)
 REPLACEMENT = re.compile(r'replacement', re.IGNORECASE)
 # A promotion records its source in the prepared PR body; without a promotion
-# workflow, a recorded source SHA plus an existing source branch is the lineage.
+# workflow, a recorded source SHA plus the direction's source branch is the
+# lineage.
 SOURCE_RECORD = re.compile(r'(?i)source[:\s`]+([0-9a-f]{40})\b')
 RELEASE_REF = re.compile(r'(?i)/releases/tag/([\w.\-]+)')
 WORKFLOW_PATH = '.github/workflows/promotion-prepare.yml'
@@ -152,47 +155,70 @@ def promotion_workflow_run(repo, head_sha, cache):
     return verified
 
 
-def source_branch_ancestor(repo, sha, branch):
-    """The recorded source SHA is on the source branch: identical to its head or
-    an ancestor of it (the branch may have moved after the promotion was prepared)."""
+def source_branches_for(base):
+    """The candidate's actual source branches per promotion direction, checked
+    against the live repository rather than assumed.
+
+    A stable-target promotion pulls from the release branch (a release-to-stable
+    promotion); a release-target promotion pulls from the default branch. Each
+    branch is still verified by comparison; the direction only decides which
+    branches are candidates, so a recorded SHA that matches neither is unverified.
+    """
+    if re.match(r'^stable', (base or '').strip(), re.IGNORECASE):
+        return ['release']
+    return ['master', 'main']
+
+
+def source_branch_ancestor(repo, ref, branch):
+    """The ref (a recorded source SHA or a release tag) is on the source branch:
+    identical to its head or an ancestor of it (the branch may have moved after
+    the promotion was prepared)."""
     result = subprocess.run(
-        ['gh', 'api', f'repos/{repo}/compare/{sha}...{branch}', '--jq', '.status'],
+        ['gh', 'api', f'repos/{repo}/compare/{ref}...{branch}', '--jq', '.status'],
         capture_output=True, text=True, timeout=25)
     if result.returncode:
         return False
     return (result.stdout or '').strip().strip('"') in ('identical', 'ahead')
 
 
-def release_evidence(repo, body):
-    """A linked GitHub release in the PR body verifies when the tag exists."""
+def release_evidence(repo, body, base=''):
+    """A linked GitHub release in the PR body verifies only when the tag exists
+    and its commit belongs to this candidate's source branch: any existing
+    release link proves nothing about the promotion it appears in."""
     match = RELEASE_REF.search(body or '')
     if not match:
         return None
-    result = subprocess.run(['gh', 'api', 'repos/' + repo + '/releases/tags/' + match.group(1),
+    tag = match.group(1)
+    result = subprocess.run(['gh', 'api', 'repos/' + repo + '/releases/tags/' + tag,
                              '--jq', '.tag_name'], capture_output=True, text=True, timeout=25)
     if result.returncode:
         return None
-    return {'kind': 'linked-release', 'tag': match.group(1), 'verified': True}
+    for branch in source_branches_for(base):
+        if source_branch_ancestor(repo, tag, branch):
+            return {'kind': 'linked-release', 'tag': tag, 'source_branch': branch,
+                    'verified': True}
+    return None
 
 
 def lineage_evidence(repo, detail, cache):
     """Verified promotion lineage beyond naming and a head commit.
 
     Three PR-specific proofs, in order of strength: a promotion-prepare workflow
-    run for this PR's head commit; a recorded source SHA verifiably on a source
-    branch; or a linked release whose tag exists. Anything less is an unverified
-    candidate and is never ranked.
+    run for this PR's head commit; a recorded source SHA verifiably on the
+    direction's source branch; or a linked release whose tag commit belongs to
+    that branch. Anything less is an unverified candidate and is never ranked.
     """
     head_sha = (detail.get('sha') or '').strip()
     if head_sha and promotion_workflow_run(repo, head_sha, cache):
         return promotion_workflow_run(repo, head_sha, cache)
+    base = (detail.get('base') or '').strip()
     record = SOURCE_RECORD.search(detail.get('body') or '')
     if record and re.fullmatch(r'[0-9a-f]{40}', record.group(1)):
-        for branch in ('master', 'main'):
+        for branch in source_branches_for(base):
             if source_branch_ancestor(repo, record.group(1), branch):
                 return {'kind': 'source-record', 'source_sha': record.group(1),
                         'source_branch': branch, 'verified': True}
-    return release_evidence(repo, detail.get('body') or '')
+    return release_evidence(repo, detail.get('body') or '', base)
 
 
 def classify(detail):
@@ -272,7 +298,8 @@ def collect(state):
             repo_key, _, sha_key = str(key).partition('|')
             if repo_key and sha_key and isinstance(value, dict):
                 lineage_cache[(repo_key, sha_key)] = value
-        queue = queue[:MAX_DETAIL_PER_REFRESH]
+        submitted = queue[:MAX_DETAIL_PER_REFRESH]
+        deferred_rows = queue[MAX_DETAIL_PER_REFRESH:]
         candidates_total = len(ordered)
 
         def verify(row):
@@ -288,7 +315,7 @@ def collect(state):
         results, failed, unverified = {}, {}, {}
         deadline = time.monotonic() + DISCOVERY_SECONDS
         with ThreadPoolExecutor(max_workers=DETAIL_WORKERS) as pool:
-            futures = {pool.submit(verify, row): row for row in queue}
+            futures = {pool.submit(verify, row): row for row in submitted}
             pending = set(futures)
             while pending and time.monotonic() < deadline:
                 done, pending = wait(pending, timeout=1)
@@ -317,6 +344,12 @@ def collect(state):
             for row in futures.values():
                 if row['url'] not in examined:
                     unverified[row['url']] = 'detail verification deferred to a later refresh'
+            # Beyond-budget candidates are deferred, not dropped: each stays
+            # individually visible with its recheck condition, so a promotion
+            # late in a large open-PR list can never silently lose priority.
+            for row in deferred_rows:
+                unverified[row['url']] = ('detail verification deferred beyond this refresh\'s '
+                                          'budget; recheck after the next refresh cycle')
         fresh_urls = {i['url'] for i in fresh}
         # Rebuild from live search: a merged or closed promotion disappears instead
         # of ranking forever. Still-open items this refresh could not verify stay

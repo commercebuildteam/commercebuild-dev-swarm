@@ -924,20 +924,26 @@ def approved_on_head(url, head):
 
 
 def review_posted_on_head(url, head, since):
-    """Completion proof for a dispatched reviewer job: a review or comment by the
-    reviewer execution account on the PR's current head during this run. An
-    existing bhalecb review request proves nothing about whether the review ran."""
+    """Completion proof for a dispatched reviewer job: a formal review by the
+    reviewer execution account bound to the PR's current head, or that account's
+    comment during this run carrying the structured result marker and naming
+    this head. An existing bhalecb review request proves nothing about whether
+    the review ran, and an ordinary implementation comment that merely quotes
+    findings, or any comment that neither names the head nor carries the
+    marker, is never completion evidence."""
     match = TICKET_RE.match(url or '')
     if not match:
         return False
     repo, number = match.group(1), match.group(2)
     checks = [
-        ['gh', 'api', f'repos/{repo}/pulls/{number}/reviews', '--jq',
-         '[.[] | select(.user.login == "commercebuild") | {commit_id, submitted_at}]'],
-        ['gh', 'api', f'repos/{repo}/issues/{number}/comments', '--jq',
-         '[.[] | select(.user.login == "commercebuild") | {submitted_at: .created_at}]'],
+        ('review',
+         ['gh', 'api', f'repos/{repo}/pulls/{number}/reviews', '--jq',
+          '[.[] | select(.user.login == "commercebuild") | {commit_id, submitted_at}]']),
+        ('comment',
+         ['gh', 'api', f'repos/{repo}/issues/{number}/comments', '--jq',
+          '[.[] | select(.user.login == "commercebuild") | {body, submitted_at: .created_at}]']),
     ]
-    for command in checks:
+    for kind, command in checks:
         try:
             result = subprocess.run(command, check=True, capture_output=True, text=True, timeout=30)
             rows = json.loads(result.stdout or '[]')
@@ -947,7 +953,11 @@ def review_posted_on_head(url, head, since):
             at = parse_ts(row.get('submitted_at'))
             if not since or not at or at < since:
                 continue
-            if row.get('commit_id') in (None, head):
+            if kind == 'review':
+                if head and row.get('commit_id') == head:
+                    return True
+            elif head and REVIEW_RESULT_RE.search(row.get('body') or '') \
+                    and str(head)[:7] in (row.get('body') or ''):
                 return True
     return False
 
@@ -1546,6 +1556,10 @@ def dispatch_round(args, model, session):
 
 ACTIVITY_PATH = STATE / 'activity-seen.json'
 TICKET_RE = re.compile(r'https://github\.com/(commercebuildteam/[^/\s]+)/(?:issues|pull)/(\d+)')
+# Structured result marker a reviewer completion comment must carry, together
+# with the reviewed head SHA. An ordinary implementation comment that merely
+# quotes findings is never review evidence.
+REVIEW_RESULT_RE = re.compile(r'(?i)review result:\s*(findings posted|no findings)')
 
 
 def worker_id_for(url):
@@ -1766,7 +1780,11 @@ def write_prompt(worker_id, repo, url, title, note='', mode='developer'):
             'You are the Woo Reviewer acting for bhalecb. Work only on this review item.\n\n'
             f'REPOSITORY: {repo}\nITEM: {url}\n\nTITLE: {title}\n\n'
             'This is a reviewer-only job. Review the pull request as bhalecb: read the '
-            'current head, run the repository gates, and post your review findings. Do '
+            'current head, run the repository gates, and post your review findings. Post '
+            'the findings as a GitHub review on the current head. If you post them as a '
+            'comment instead, include the exact head SHA and one line "Review result: '
+            'findings posted", or "Review result: no findings" when the head passes every '
+            'gate; the scheduler settles this job only on that head-specific evidence. Do '
             'not implement code changes, do not push commits, and never request your own '
             'review. Approval, merge, and deployment decisions stay with bhalecb; stop at '
             'the review handoff and return a structured checkpoint with the head SHA, the '

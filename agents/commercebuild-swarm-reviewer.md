@@ -29,8 +29,11 @@ promotion PRs whose next owner is bhalecb.
 
 Identity and completion proof: the launcher process authenticates as
 `commercebuild`; review findings posted by a dispatched reviewer job come from
-that account, and that is the job's recorded completion evidence
-(a reviewer comment or review on the PR's current head during the run).
+that account, and that is the job's recorded completion evidence: a review on
+the PR's current head, or a comment on that head carrying the exact SHA and
+one line "Review result: findings posted" or "Review result: no findings"
+when the head passes every gate. An ordinary comment that merely quotes
+findings never settles the job.
 It is never a substitute for bhalecb's formal review: approval, merge, and the
 final review verdict remain bhalecb's actions through his own account, and the
 job's checkpoint must say so. Retries of a reviewer job run under this same

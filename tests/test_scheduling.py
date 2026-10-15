@@ -235,7 +235,7 @@ class PromotionCollection(unittest.TestCase):
 
     def test_linked_release_evidence_verifies_lineage(self):
         """A promotion PR body linking an existing release tag is lineage evidence
-        when neither a workflow run nor a source record applies."""
+        only when the tag's commit belongs to the direction's source branch."""
         url = promotion_node()['url']
         search = {'total_count': 1, 'incomplete_results': False, 'items': [
             {'number': 99, 'html_url': url, 'title': 'Promotion: release 3.4',
@@ -255,6 +255,11 @@ class PromotionCollection(unittest.TestCase):
                 return mock.Mock(returncode=0, stdout='[]', stderr='')
             if '/releases/tags/' in joined:
                 return mock.Mock(returncode=0, stdout='"v3.4.0"', stderr='')
+            if '/compare/' in joined:
+                # The tag commit must be on the promotion's source branch.
+                if 'main' in joined:
+                    return mock.Mock(returncode=0, stdout='"ahead"', stderr='')
+                return mock.Mock(returncode=0, stdout='"diverged"', stderr='')
             raise AssertionError('unexpected gh call: %r' % (command[:6],))
 
         searches = {**search, 'details': {'99': dict(promotion_node(), url=url,
@@ -263,6 +268,165 @@ class PromotionCollection(unittest.TestCase):
             result = promotion_source.collect(self.state)
         self.assertEqual(len(result['items']), 1)
         self.assertEqual(result['items'][0]['lineage']['kind'], 'linked-release')
+        self.assertEqual(result['items'][0]['lineage']['source_branch'], 'main')
+
+    def test_unrelated_release_tag_is_never_lineage(self):
+        """A release-target PR whose body links an existing tag that is not on the
+        direction's source branch stays unverified: the link alone proves nothing."""
+        url = promotion_node()['url']
+        search = {'total_count': 1, 'incomplete_results': False, 'items': [
+            {'number': 99, 'html_url': url, 'title': 'promote-experiment',
+             'repository_url': 'https://api.github.com/repos/commercebuildteam/client-site',
+             'updated_at': '2026-10-15T10:00:00Z', 'user': {'login': 'commercebuild'},
+             'draft': False}]}
+
+        def run(command, **kwargs):
+            joined = ' '.join(command)
+            if 'search/issues' in joined:
+                return mock.Mock(returncode=0, stdout=json.dumps(search), stderr='')
+            if '/pulls/' in joined:
+                number = re.search(r'/pulls/(\d+)', joined).group(1)
+                return mock.Mock(returncode=0,
+                                 stdout=json.dumps(dict(searches['details'][number])), stderr='')
+            if '/actions/runs' in joined:
+                return mock.Mock(returncode=0, stdout='[]', stderr='')
+            if '/releases/tags/' in joined:
+                return mock.Mock(returncode=0, stdout='"v9.9.9"', stderr='')
+            if '/compare/' in joined:
+                # An unrelated tag: diverged from every direction source branch.
+                return mock.Mock(returncode=0, stdout='"diverged"', stderr='')
+            raise AssertionError('unexpected gh call: %r' % (command[:6],))
+
+        searches = {**search, 'details': {'99': dict(promotion_node(), url=url, title='promote-experiment',
+                                                     body='Prepared from /releases/tag/v9.9.9.')}}
+        with mock.patch.object(promotion_source.subprocess, 'run', run):
+            result = promotion_source.collect(self.state)
+        self.assertEqual(result['items'], [])
+        self.assertIn(url, result['unverified'])
+
+    def test_release_to_stable_source_record_verifies_against_release_branch(self):
+        """A stable-target promotion's recorded source SHA is checked against the
+        release branch, the actual source of that direction, never master/main."""
+        url = promotion_node(base='stable', head='cb-promotion/stable-3.4')['url']
+        sha = '04d12f0abc' + '0' * 30
+        search = {'total_count': 1, 'incomplete_results': False, 'items': [
+            {'number': 99, 'html_url': url, 'title': 'Promotion: release 3.4',
+             'repository_url': 'https://api.github.com/repos/commercebuildteam/client-site',
+             'updated_at': '2026-10-15T10:00:00Z', 'user': {'login': 'commercebuild'},
+             'draft': False}]}
+        compared = []
+
+        def run(command, **kwargs):
+            joined = ' '.join(command)
+            if 'search/issues' in joined:
+                return mock.Mock(returncode=0, stdout=json.dumps(search), stderr='')
+            if '/pulls/' in joined:
+                number = re.search(r'/pulls/(\d+)', joined).group(1)
+                return mock.Mock(returncode=0,
+                                 stdout=json.dumps(dict(searches['details'][number])), stderr='')
+            if '/actions/runs' in joined:
+                return mock.Mock(returncode=0, stdout='[]', stderr='')
+            if '/compare/' in joined:
+                compared.append(joined.split('/compare/')[1])
+                return mock.Mock(returncode=0, stdout='"identical"', stderr='')
+            raise AssertionError('unexpected gh call: %r' % (command[:6],))
+
+        searches = {**search, 'details': {'99': dict(
+            promotion_node(base='stable', head='cb-promotion/stable-3.4'), url=url,
+            body='Prepared from source ' + sha + '.')}}
+        with mock.patch.object(promotion_source.subprocess, 'run', run):
+            result = promotion_source.collect(self.state)
+        self.assertEqual(len(result['items']), 1)
+        self.assertEqual(result['items'][0]['lineage']['kind'], 'source-record')
+        self.assertEqual(result['items'][0]['lineage']['source_branch'], 'release')
+        # Only the direction's source branch was compared, never master/main.
+        self.assertEqual(len(compared), 1)
+        self.assertTrue(compared[0].startswith(sha + '...release'))
+
+    def test_source_record_diverged_from_direction_branch_is_unverified(self):
+        """A stable-target promotion whose recorded source SHA is on neither the
+        release branch nor any assumed default branch is unverified and unranked."""
+        url = promotion_node(base='stable', head='cb-promotion/stable-3.4')['url']
+        sha = '04d12f0abc' + '0' * 30
+        search = {'total_count': 1, 'incomplete_results': False, 'items': [
+            {'number': 99, 'html_url': url, 'title': 'Promotion: release 3.4',
+             'repository_url': 'https://api.github.com/repos/commercebuildteam/client-site',
+             'updated_at': '2026-10-15T10:00:00Z', 'user': {'login': 'commercebuild'},
+             'draft': False}]}
+
+        def run(command, **kwargs):
+            joined = ' '.join(command)
+            if 'search/issues' in joined:
+                return mock.Mock(returncode=0, stdout=json.dumps(search), stderr='')
+            if '/pulls/' in joined:
+                number = re.search(r'/pulls/(\d+)', joined).group(1)
+                return mock.Mock(returncode=0,
+                                 stdout=json.dumps(dict(searches['details'][number])), stderr='')
+            if '/actions/runs' in joined:
+                return mock.Mock(returncode=0, stdout='[]', stderr='')
+            if '/compare/' in joined:
+                return mock.Mock(returncode=0, stdout='"diverged"', stderr='')
+            raise AssertionError('unexpected gh call: %r' % (command[:6],))
+
+        searches = {**search, 'details': {'99': dict(
+            promotion_node(base='stable', head='cb-promotion/stable-3.4'), url=url,
+            body='Prepared from source ' + sha + '.')}}
+        with mock.patch.object(promotion_source.subprocess, 'run', run):
+            result = promotion_source.collect(self.state)
+        self.assertEqual(result['items'], [])
+        self.assertIn(url, result['unverified'])
+
+    def test_deferred_candidate_beyond_detail_budget_stays_visible(self):
+        """A new custom promotion after 200 ordinary open PRs is deferred by this
+        refresh's budget but stays individually visible in unverified, so its
+        blocked state and recheck condition surface while verification continues."""
+        promo_url = 'https://github.com/commercebuildteam/client-site/pull/201'
+        search = {'total_count': 201, 'incomplete_results': False, 'items': []}
+        details = {}
+        for number in range(1, 202):
+            if number == 201:
+                search['items'].append({
+                    'number': 201, 'html_url': promo_url, 'title': 'Custom build target',
+                    'repository_url': 'https://api.github.com/repos/commercebuildteam/client-site',
+                    'updated_at': '2026-10-15T10:00:00Z', 'user': {'login': 'commercebuild'},
+                    'draft': False})
+                details['201'] = dict(promotion_node(head='promote%2F3-5-a1b2c3d4',
+                                                     title='Custom build target'), url=promo_url)
+            else:
+                search['items'].append({
+                    'number': number, 'html_url': f'https://github.com/commercebuildteam/client-site/pull/{number}',
+                    'title': 'Update deps',
+                    'repository_url': 'https://api.github.com/repos/commercebuildteam/client-site',
+                    'updated_at': '2026-10-15T09:00:00Z', 'user': {'login': 'bhalecb'},
+                    'draft': False})
+                details[str(number)] = {'url': f'https://github.com/commercebuildteam/client-site/pull/{number}',
+                                        'base': 'main', 'head': 'feature', 'sha': 'b' * 40,
+                                        'head_repo': 'commercebuildteam/client-site',
+                                        'draft': False, 'mergeable': 'clean',
+                                        'author': 'bhalecb', 'body': '', 'title': 'Update deps'}
+
+        def run(command, **kwargs):
+            joined = ' '.join(command)
+            if 'search/issues' in joined:
+                return mock.Mock(returncode=0, stdout=json.dumps(search), stderr='')
+            if '/pulls/' in joined:
+                number = re.search(r'/pulls/(\d+)', joined).group(1)
+                return mock.Mock(returncode=0, stdout=json.dumps(details[number]), stderr='')
+            if '/actions/runs' in joined:
+                return mock.Mock(returncode=0, stdout='[]', stderr='')
+            if '/compare/' in joined:
+                return mock.Mock(returncode=0, stdout='"diverged"', stderr='')
+            if '/releases/tags/' in joined:
+                return mock.Mock(returncode=1, stdout='', stderr='Not Found')
+            raise AssertionError('unexpected gh call: %r' % (command[:6],))
+
+        with mock.patch.object(promotion_source.subprocess, 'run', run):
+            result = promotion_source.collect(self.state)
+        self.assertTrue(result['truncated'])
+        self.assertEqual(result['items'], [])
+        self.assertIn(promo_url, result['unverified'])
+        self.assertIn('deferred', result['unverified'][promo_url])
+        self.assertIn('recheck', result['unverified'][promo_url].lower())
 
     def test_short_source_sha_in_body_is_never_lineage(self):
         """A short hex token in the body is not a source SHA: without a verifiable
@@ -834,6 +998,53 @@ class ReviewerRoutingAndCapacity(unittest.TestCase):
             return mock.Mock(returncode=0, stdout='[]', stderr='')
 
         with mock.patch.object(module.subprocess, 'run', fake_run_after):
+            status, verdict = module.settle_status(entry, DONAVON_PR, started)
+        self.assertEqual(status, 'completed')
+        self.assertIn('remain', verdict)
+
+    def test_review_completion_comment_needs_result_marker_and_head(self):
+        """A reviewer comment settles the job only when it carries the structured
+        result marker and names the reviewed head: an ordinary implementation
+        comment that quotes findings, a marker without the head, or evidence from
+        before the run proves nothing, while a marker comment on the head does."""
+        module = self._module()
+        entry = {'worker_id': 'w-r-9', 'repo': 'commercebuildteam/r',
+                 'issue': DONAVON_PR, 'kind': 'review'}
+        started = '2026-10-15T12:00:00Z'
+        head = 'a' * 40
+
+        def comment_run(body, at='2026-10-15T12:30:00Z'):
+            def run(command, **kwargs):
+                joined = ' '.join(command)
+                if '/reviews' in joined and 'pulls/' in joined:
+                    return mock.Mock(returncode=0, stdout='[]', stderr='')
+                if '/issues/' in joined:
+                    return mock.Mock(returncode=0, stdout=json.dumps(
+                        [{'user': {'login': 'commercebuild'}, 'body': body,
+                          'submitted_at': at}]), stderr='')
+                if 'view' in joined:
+                    return mock.Mock(returncode=0, stdout=json.dumps(
+                        {'state': 'OPEN', 'headRefOid': head}), stderr='')
+                return mock.Mock(returncode=0, stdout='[]', stderr='')
+            return run
+
+        # An ordinary implementation comment quoting findings is never evidence.
+        ordinary = 'I addressed the findings from your review and pushed the fixes.'
+        with mock.patch.object(module.subprocess, 'run', comment_run(ordinary)):
+            status, _ = module.settle_status(entry, DONAVON_PR, started)
+        self.assertEqual(status, 'incomplete')
+        # The marker without the reviewed head is not head-specific evidence.
+        with mock.patch.object(module.subprocess, 'run',
+                               comment_run('Review result: findings posted.')):
+            status, _ = module.settle_status(entry, DONAVON_PR, started)
+        self.assertEqual(status, 'incomplete')
+        # Head-bound marker posted before the run started proves nothing.
+        before = 'Review result: findings posted for head ' + head
+        with mock.patch.object(module.subprocess, 'run', comment_run(before, at='2026-10-15T11:00:00Z')):
+            status, _ = module.settle_status(entry, DONAVON_PR, started)
+        self.assertEqual(status, 'incomplete')
+        # A current-head result comment settles the job as complete.
+        with mock.patch.object(module.subprocess, 'run', comment_run(before)):
             status, verdict = module.settle_status(entry, DONAVON_PR, started)
         self.assertEqual(status, 'completed')
         self.assertIn('remain', verdict)
