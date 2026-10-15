@@ -26,6 +26,10 @@ PREPARED_HEAD = re.compile(r'^(cb-promotion|promotion-prepare|promote)', re.IGNO
 # custom tokens instead of a plain branch word.
 ENCODED_HEAD = re.compile(r'%[0-9a-fA-F]{2}|[A-Za-z0-9]+-[0-9a-f]{8,}', re.IGNORECASE)
 REPLACEMENT = re.compile(r'replacement', re.IGNORECASE)
+# A promotion records its source in the prepared PR body; without a promotion
+# workflow, a recorded source SHA plus an existing source branch is the lineage.
+SOURCE_RECORD = re.compile(r'(?i)source[:\s`]+([0-9a-f]{7,40})')
+WORKFLOW_PATH = '.github/workflows/promotion-prepare.yml'
 # Title words only prioritize which candidates are verified first within the
 # per-refresh budget; branch structure verification alone classifies, and the
 # rotation reaches every open PR.
@@ -112,6 +116,39 @@ def branch_evidence(detail):
             'head_repo': head_repo, 'verified': verified}
 
 
+def has_promotion_workflow(repo, cache):
+    """Cached per-refresh workflow check; the prepared snapshot proves lineage.
+    Existence only: the presence of the promotion workflow file is the evidence."""
+    if repo in cache:
+        return cache[repo]
+    result = subprocess.run(['gh', 'api', 'repos/' + repo + '/contents/' + WORKFLOW_PATH,
+                             '--jq', '.name'], capture_output=True, text=True, timeout=25)
+    cache[repo] = result.returncode == 0
+    return cache[repo]
+
+
+def lineage_evidence(repo, detail, cache):
+    """Verified promotion lineage beyond naming and a head commit.
+
+    A repository promotion workflow proves the promotion was machine-prepared.
+    Without one, a recorded source SHA in the PR body plus an existing source
+    branch is the lineage. Anything less is an unverified candidate.
+    """
+    if has_promotion_workflow(repo, cache):
+        return {'kind': 'promotion-workflow', 'workflow': WORKFLOW_PATH, 'verified': True}
+    record = SOURCE_RECORD.search(detail.get('body') or '')
+    if not record:
+        return None
+    for branch in ('master', 'main'):
+        result = subprocess.run(['gh', 'api', 'repos/' + repo + '/branches/' + branch,
+                                 '--jq', '.name'], capture_output=True, text=True, timeout=25)
+        if result.returncode:
+            continue
+        return {'kind': 'source-record', 'source_sha': record.group(1),
+                'source_branch': branch, 'verified': True}
+    return None
+
+
 def classify(detail):
     """Return a promotion item, or None when the PR is not a promotion.
 
@@ -184,6 +221,8 @@ def collect(state):
         queue = [r for r in ordered if r['url'] in likely] + \
                 [r for r in ordered if r['url'] not in likely]
         fresh, examined = [], set()
+        workflow_cache = {r: True for r in (old.get('workflow_repos') or [])
+                          if isinstance(r, str)}
         detail_budget = MAX_DETAIL_PER_REFRESH
         for row in queue:
             # No title filter here: a custom or replacement promotion may not carry
@@ -201,6 +240,17 @@ def collect(state):
                 result['errors'].append(f'{row["url"]}: {type(exc).__name__}')
                 continue
             if item:
+                # Branch structure alone is naming: verify the promotion lineage
+                # (workflow, or recorded source SHA plus an existing source branch)
+                # before ranking. Unverified candidates stay visible, never ranked.
+                try:
+                    lineage = lineage_evidence(row['repo'], detail, workflow_cache)
+                except (subprocess.SubprocessError, OSError, ValueError):
+                    lineage = None
+                if not lineage or not lineage.get('verified'):
+                    result['unverified'][row['url']] = 'promotion lineage unverified: no promotion workflow and no recorded source branch/SHA'
+                    continue
+                item['lineage'] = lineage
                 fresh = [i for i in fresh if i['url'] != item['url']]
                 fresh.append(item)
         fresh_urls = {i['url'] for i in fresh}
@@ -209,12 +259,13 @@ def collect(state):
         # visible with their previous evidence until the rotation reaches them.
         kept = [i for i in old.get('items') or []
                 if i['url'] in open_urls and i['url'] not in fresh_urls
-                and i['url'] not in examined]
+                and i['url'] not in examined and i.get('lineage', {}).get('verified')]
         result['items'] = fresh + kept
-        result['unverified'] = {row['url']: 'detail verification deferred to a later refresh'
-                                for row in queue if row['url'] not in examined}
+        result['unverified'].update({row['url']: 'detail verification deferred to a later refresh'
+                                     for row in queue if row['url'] not in examined})
         result['truncated'] = detail_budget <= 0 and len(queue) > len(examined)
         result['cursor'] = (start + len(examined)) % len(rows) if rows else 0
+        result['workflow_repos'] = sorted(r for r, v in workflow_cache.items() if v)
     except (subprocess.SubprocessError, RuntimeError, ValueError, OSError) as exc:
         result['errors'].append(str(exc) if isinstance(exc, RuntimeError) else type(exc).__name__)
         # Rate limiting and permission failures keep last-known items visible.

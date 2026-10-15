@@ -29,6 +29,7 @@ CODEX_REGISTRATION = Path.home() / '.agents/state/commercebuild-swarm/thread-id'
 FIELDS = ('assigned_issues', 'assigned_prs', 'authored_prs')
 COORDINATOR_AGENT = 'commercebuild-swarm-coordinator'
 DEVELOPER_AGENT = 'commercebuild-swarm-developer'
+REVIEWER_AGENT = 'commercebuild-swarm-reviewer'
 DEFAULT_MODEL = 'openrouter/z-ai/glm-5.3-flash'  # Override per run with --model; --model "" uses the session default
 # The developer agent's scope gate requires the ticket to be assigned to
 # `commercebuild`. Reassigning a ticket to bhalecb is the hand-back signal, so
@@ -591,8 +592,10 @@ def preflight():
     if gh_json('api', 'user').get('login') != 'commercebuild':
         raise RuntimeError('GitHub account must be commercebuild; no automatic account switching')
     config_dir = Path.home() / '.config/opencode/agents'
-    for role_file in (f'{COORDINATOR_AGENT}.md', f'{DEVELOPER_AGENT}.md'):
-        if not (config_dir / role_file).is_file():
+    for role_file in (f'{COORDINATOR_AGENT}.md', f'{DEVELOPER_AGENT}.md', f'{REVIEWER_AGENT}.md'):
+        candidates = [config_dir / role_file,
+                      Path(__file__).resolve().parent.parent / 'agents' / role_file]
+        if not any(c.is_file() for c in candidates):
             raise RuntimeError(f'Missing OpenCode agent: {config_dir / role_file}')
 
 
@@ -673,6 +676,30 @@ def poll_loop(stop, interval=60):
         except Exception as exc:
             atomic(STATE / 'poll-status.json', {'ok': False, 'completed_at': stamp(),
                                                'errors': {'poll': type(exc).__name__}})
+        deadline = max(deadline + interval, time.monotonic() + min(1, interval))
+
+
+def freshness_loop(stop, interval=60):
+    """Independent 60-second promotion and ticket-priority refresh.
+
+    priority_schedule.refresh is cached and internally rate-limited, and promotion
+    discovery rides the same cadence. A long or idle dispatch round must not miss
+    the discovery deadline, so this loop runs outside the round and records bounded
+    freshness evidence instead of raising into the dispatch path."""
+    deadline = time.monotonic() + interval
+    while not stop.wait(max(0, deadline - time.monotonic())):
+        errors, seconds = {}, {}
+        for name, task in (('priority', lambda: priority_schedule.refresh(STATE, background=False)),
+                           ('promotions', lambda: promotion_source.collect(STATE)),
+                           ('review_intake', lambda: review_intake.refresh(STATE))):
+            began = time.monotonic()
+            try:
+                task()
+            except Exception as exc:
+                errors[name] = type(exc).__name__
+            seconds[name] = round(time.monotonic() - began, 3)
+        atomic(STATE / 'freshness-status.json', {'completed_at': stamp(), 'ok': not errors,
+                                                 'errors': errors, 'seconds': seconds})
         deadline = max(deadline + interval, time.monotonic() + min(1, interval))
 
 
@@ -959,7 +986,7 @@ def recovery_text(previous, latest):
     return (prior.split('\n\nLATEST ATTEMPT OUTPUT')[0][:14000] + '\n\nLATEST ATTEMPT OUTPUT (recheck live state):\n' + latest[-5000:])[-20000:]
 
 
-def run_worker(args, model, worker_id, prompt, attempt=1):
+def run_worker(args, model, worker_id, prompt, attempt=1, agent=DEVELOPER_AGENT):
     """Run one developer as its own primary opencode session and capture its checkpoint.
 
     Subagent sessions spawned under a headless `opencode run` client wedge: their
@@ -1004,7 +1031,7 @@ def run_worker(args, model, worker_id, prompt, attempt=1):
             log_path = STATE / 'dispatch' / (worker_id + '.log')
             log_path.parent.mkdir(parents=True, exist_ok=True)
             attached = ServerTransport(server_url, password, cwd=args.cwd, model=model,
-                agent=DEVELOPER_AGENT, hard_seconds=WORKER_CAP_SECONDS,
+                agent=agent, hard_seconds=WORKER_CAP_SECONDS,
                 idle_seconds=WORKER_IDLE_SECONDS, stop=STOPPING, owns_session=owned,
                 skip_permissions=getattr(args, 'skip_permissions', False),
                 log_path=log_path, on_start=started,
@@ -1032,7 +1059,7 @@ def run_worker(args, model, worker_id, prompt, attempt=1):
     log_path = STATE / 'dispatch' / (worker_id + '.log')
     log_path.parent.mkdir(parents=True, exist_ok=True)
     command = ['opencode', 'run', '--standalone', '--format', 'json',
-               '--agent', DEVELOPER_AGENT,
+               '--agent', agent,
                '--title', 'swarm-worker: ' + worker_id]
     if model:
         command += ['--model', model]
@@ -1235,7 +1262,8 @@ def run_entry(args, model, session, item):
     started_clock = time.monotonic()
     log(f'[dispatch] {worker_id}: starting')
     try:
-        status, worker_session, checkpoint = run_worker(args, model, worker_id, prompt, 1)
+        status, worker_session, checkpoint = run_worker(
+            args, model, worker_id, prompt, 1, agent=agent_for_entry(entry))
         attempts = 1
         execution_status = status
         verdict = ''
@@ -1660,8 +1688,20 @@ def prior_run_section(worker_id):
             f'{tail}\n\n')
 
 
-def write_prompt(worker_id, repo, url, title, note=''):
+def write_prompt(worker_id, repo, url, title, note='', mode='developer'):
     prompt_path = STATE / 'dispatch' / (worker_id + '.md')
+    if mode == 'review':
+        prompt_path.parent.mkdir(parents=True, exist_ok=True)
+        prompt_path.write_text(
+            'You are the Woo Reviewer acting for bhalecb. Work only on this review item.\n\n'
+            f'REPOSITORY: {repo}\nITEM: {url}\n\nTITLE: {title}\n\n'
+            'This is a reviewer-only job. Review the pull request as bhalecb: read the '
+            'current head, run the repository gates, and post your review findings. Do '
+            'not implement code changes, do not push commits, and never request your own '
+            'review. Approval, merge, and deployment decisions stay with bhalecb; stop at '
+            'the review handoff and return a structured checkpoint with the head SHA, the '
+            'checks you ran, and every finding.\n')
+        return prompt_path
     kind = 'pull request' if '/pull/' in url else 'issue'
     owed = (f'NEXT ACTION OWED BY commercebuild (from GitHub): {note}. Resolve exactly that, '
             'push, and re-request review from bhalecb on the new head.\n\n') if note else ''
@@ -1797,6 +1837,25 @@ def interleave_work_lanes(owed, recovery, new):
     return ordered
 
 
+def review_entry_urls(state):
+    """URLs that dispatch as reviewer-only jobs: Donavon-requested reviews and
+    verified promotions whose next owner is bhalecb. Promotion repairs that need a
+    verified source change stay with donavon-commercebuild and are never dispatched
+    as developer implementation work by this swarm."""
+    urls = {i['url'] for i in review_intake.snapshot(state).get('items', [])
+            if i.get('donavon_request')}
+    urls.update(i['url'] for i in promotion_source.items(state)
+                if i.get('next_owner') == 'bhalecb')
+    return urls
+
+
+def agent_for_entry(entry):
+    """Review items never run under the developer agent: a Donavon request to
+    bhalecb must not launch implementation, and a promotion decision is a review,
+    not a code task."""
+    return REVIEWER_AGENT if entry.get('kind') == 'review' else DEVELOPER_AGENT
+
+
 def repository_last_served():
     """Find the most recent worker start in each repository from durable checkpoints."""
     last = {}
@@ -1845,11 +1904,62 @@ def issue_requires_reassessment(item):
     return updated > finished
 
 
+def record_high_tier(session):
+    """Capacity-independent durable queue insertion for review-tier items.
+
+    Donavon-requested reviews and verified promotions must stay queued and visible
+    while every developer slot is claimed; the two-concurrent review cap remains a
+    dispatch-time check, so freeing a slot starts an already-queued review without
+    re-discovery. No claim is taken here: prepare_entry claims at dispatch time.
+    """
+    existing = read_queue()
+    busy_repos = {e.get('repo') for e in existing if e.get('state') in ('pending', 'running')}
+    busy_workers = {e.get('worker_id') for e in existing if e.get('state') in ('pending', 'running')}
+    queued_urls = {e.get('issue') for e in existing}
+    archived = archived_repos()
+    candidates = [i for i in review_intake.snapshot(STATE).get('items', [])
+                  if i.get('donavon_request')]
+    candidates += [i for i in promotion_source.items(STATE)
+                   if i.get('next_owner') == 'bhalecb']
+    recorded = []
+    for item in candidates:
+        url = item.get('url') or ''
+        if not url or url in queued_urls:
+            continue
+        repo = '/'.join(url.split('/')[3:5]).lower()
+        worker_id = worker_id_for(url)
+        if not repo or not worker_id or repo in busy_repos or worker_id in busy_workers \
+                or repo in archived:
+            continue
+        write_prompt(worker_id, repo, url, item.get('title') or '', mode='review')
+
+        def mutate(entries, worker_id=worker_id, repo=repo, url=url, item=item):
+            if any(e.get('worker_id') == worker_id
+                   and e.get('state') in ('pending', 'running') for e in entries):
+                return None
+            kept = [e for e in entries if e.get('worker_id') != worker_id]
+            return [{'worker_id': worker_id, 'repo': repo, 'issue': url, 'claim_id': '',
+                     'prompt_file': worker_id + '.md',
+                     'issue_updated_at': item.get('updatedAt') or item.get('updated_at') or '',
+                     'state': 'pending', 'updated_at': stamp(), 'kind': 'review'}] + kept
+        update_queue(mutate)
+        queued_urls.add(url)
+        busy_repos.add(repo)
+        busy_workers.add(worker_id)
+        recorded.append({'worker_id': worker_id, 'url': url})
+    if recorded:
+        log('intake: queued review-tier items at full capacity: '
+            + ', '.join(r['worker_id'] for r in recorded))
+    return recorded
+
+
 def direct_intake(session, limit=SLOTS, assignee=DEFAULT_ASSIGNEE):
     """Deterministic intake from open GitHub assignments; writes queue entries only."""
     limit = min(limit, SLOTS - len(read(STATE / 'claims.json')))
     if limit <= 0:
-        return []  # every developer slot is claimed; nothing to search for
+        # Every developer slot is claimed, but review-tier intake is independent of
+        # capacity: the requests enter the durable pending queue anyway.
+        return record_high_tier(session)
     priority_schedule.refresh(STATE, background=False)
     rows, seen_urls = [], set()
     searches = (('issues', ['--assignee', assignee]),
@@ -1931,6 +2041,16 @@ def direct_intake(session, limit=SLOTS, assignee=DEFAULT_ASSIGNEE):
         ((item.get('repository') or {}).get('nameWithOwner') or '').lower(), never_served))
     now = datetime.datetime.now(datetime.timezone.utc)
     rows = priority_schedule.order(aged_waiting_first(rows, now), STATE)
+    # Review-tier routing: Donavon-requested reviews and verified promotions run as
+    # reviewer-only jobs; promotion repairs needing a verified source change stay
+    # with donavon-commercebuild and are never dispatched as developer work here.
+    review_urls = review_entry_urls(STATE)
+    repair_urls = {i['url'] for i in promotion_source.items(STATE)
+                   if i.get('next_owner') == 'donavon-commercebuild'}
+    rows = [item for item in rows if item.get('url') not in repair_urls]
+    for item in rows:
+        if item.get('url') in review_urls:
+            item['kind'] = 'review'
     existing = read_queue()
     busy_repos = {e.get('repo') for e in existing if e.get('state') in ('pending', 'running')}
     busy_workers = {e.get('worker_id') for e in existing if e.get('state') in ('pending', 'running')}
@@ -1975,10 +2095,12 @@ def direct_intake(session, limit=SLOTS, assignee=DEFAULT_ASSIGNEE):
         except Exception as exc:
             log(f'intake: cannot claim {repo} ({exc}); stopping this pass')
             break
-        prompt_path = write_prompt(worker_id, repo, url, title, note)
+        prompt_path = write_prompt(worker_id, repo, url, title, note,
+                                   mode='review' if item.get('kind') == 'review' else 'developer')
         new_entries.append({'worker_id': worker_id, 'repo': repo, 'issue': url, 'owed': note or None, 'owed_head': owed_head,
                             'claim_id': claim['id'], 'prompt_file': prompt_path.name,
                             'issue_updated_at': updated_at, 'routing_sources': routing_sources,
+                            'kind': item.get('kind') or 'developer',
                             'state': 'pending', 'updated_at': stamp()})
     if new_entries:
         new_ids = {e['worker_id'] for e in new_entries}
@@ -2227,6 +2349,10 @@ def run_round(args, final_status='stopped'):
         stop = threading.Event()
         watcher = threading.Thread(target=poll_loop, args=(stop,), daemon=True)
         watcher.start()
+        # Promotion and ticket-priority discovery must not depend on dispatch cadence.
+        freshness = threading.Thread(target=freshness_loop, args=(stop,), daemon=True,
+                                     name='freshness-poller')
+        freshness.start()
         try:
             # GitHub assignment discovery is deterministic and should not wait for
             # an LLM coordinator. Use the assignee's open issues and PRs first.
@@ -2235,11 +2361,12 @@ def run_round(args, final_status='stopped'):
                         and (STATE / 'dispatch' / (str(e.get('worker_id') or '') + '.md')).exists()]
             direct_queue = []
             free = SLOTS - len(queued())  # requeued tickets have first call on the slots
-            if free > 0:
-                try:
-                    direct_queue = direct_intake(session, limit=free, assignee=args.assignee)
-                except Exception as exc:
-                    log(f'direct intake failed ({type(exc).__name__}: {exc}); dispatching any queued work')
+            try:
+                # Review-tier intake must run even at full capacity; direct_intake
+                # records durable pending entries when limit reaches zero.
+                direct_queue = direct_intake(session, limit=free, assignee=args.assignee)
+            except Exception as exc:
+                log(f'direct intake failed ({type(exc).__name__}: {exc}); dispatching any queued work')
             pending = queued()
             if direct_queue or pending:
                 log(f'dispatching {len(pending)} queued ticket(s) ({len(direct_queue)} new from intake)')
@@ -2251,6 +2378,7 @@ def run_round(args, final_status='stopped'):
         finally:
             stop.set()
             watcher.join(timeout=30)
+            freshness.join(timeout=30)
             release_all_claims('round ended; launcher reconciliation', session=session)
             with RUNTIME_MUTEX:
                 current = read(STATE / 'runtime.json')

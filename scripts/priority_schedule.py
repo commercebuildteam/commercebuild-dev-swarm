@@ -35,6 +35,18 @@ def rank_map(state):
  items=merge_items(state)
  return {x['url']:RANK.get(x.get('priority'),5) for x in items}
 
+def effective_priority(native, floor):
+ """Apply the Donavon HIGH floor over a linked-ticket priority without downgrading
+ Urgent: the effective value is the higher-ranked of the two (Urgent stays above
+ HIGH; Medium or Low linked tickets never lower the request floor)."""
+ if not floor:
+  return native
+ if not native:
+  return floor
+ if native not in RANK or floor not in RANK:
+  return native
+ return native if RANK[native] < RANK[floor] else floor
+
 def merged_snapshot(state):
  """Full scheduling evidence: ticket snapshot plus Donavon-requested reviews and
  promotion rows, so the dashboard and ordering both see every tier."""
@@ -45,8 +57,17 @@ def merged_snapshot(state):
  except (OSError,ValueError):pass
  else:
   for url,item in reviews.items():
-   # The review request supplies the High floor when no ticket priority exists.
-   if (rows.get(url) or {}).get('priority') in (None,''):rows[url]=item
+   # The request supplies a HIGH floor over the linked-ticket priority: a Medium
+   # or Low linked ticket never lowers it below HIGH, and Urgent stays above.
+   floor=item.get('priority')
+   existing=rows.get(url)
+   merged=dict(item)
+   if existing:
+    merged['priority']=effective_priority(existing.get('priority'),floor)
+    merged['priority_reason']=('Donavon review request floor over linked-ticket priority'
+        if merged['priority']==floor and floor and floor!=existing.get('priority')
+        else existing.get('priority_reason') or item.get('priority_reason'))
+   rows[url]=merged
  # Promotion evidence supersedes everything for its URL: promotions outrank all.
  rows.update({i['url']:i for i in promotion_source.items(state)})
  data['items']=list(rows.values())

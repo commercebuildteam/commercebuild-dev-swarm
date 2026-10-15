@@ -6,8 +6,11 @@ Every fake `gh` fixture is synthetic; no live GitHub data is used.
 """
 import datetime
 import json
+import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -93,6 +96,15 @@ class PromotionCollection(unittest.TestCase):
                 number = command[2].rsplit('/', 1)[-1]
                 detail = dict(searches['details'][number])
                 return mock.Mock(returncode=0, stdout=json.dumps(detail), stderr='')
+            if command[1] == 'api' and '/contents/' in command[2]:
+                # Promotion workflow presence is controlled per fixture.
+                if searches.get('workflow'):
+                    return mock.Mock(returncode=0, stdout='"promotion-prepare.yml"', stderr='')
+                return mock.Mock(returncode=1, stdout='', stderr='Not Found')
+            if command[1] == 'api' and '/branches/' in command[2]:
+                if searches.get('source_branch'):
+                    return mock.Mock(returncode=0, stdout='"master"', stderr='')
+                return mock.Mock(returncode=1, stdout='', stderr='Not Found')
             raise AssertionError('unexpected gh call: %r' % (command[:4],))
         return run
 
@@ -104,7 +116,7 @@ class PromotionCollection(unittest.TestCase):
              'draft': False}]}
         details = {'99': dict(promotion_node(), url=promotion_node()['url'])}
         with mock.patch.object(promotion_source.subprocess, 'run', self.fake_gh(
-                {**search, 'details': details})):
+                {**search, 'details': details, 'workflow': True})):
             result = promotion_source.collect(self.state)
         self.assertEqual(len(result['items']), 1)
         self.assertEqual(result['items'][0]['priority'], 'Promotion')
@@ -142,10 +154,38 @@ class PromotionCollection(unittest.TestCase):
         details = {'99': dict(promotion_node(), title='Update dependencies',
                               url=promotion_node()['url'])}
         with mock.patch.object(promotion_source.subprocess, 'run', self.fake_gh(
-                {**search, 'details': details})):
+                {**search, 'details': details, 'workflow': True})):
             result = promotion_source.collect(self.state)
         self.assertEqual(len(result['items']), 1)
         self.assertEqual(result['items'][0]['priority'], 'Promotion')
+
+    def test_promotion_without_workflow_needs_recorded_source_lineage(self):
+        """Branch structure alone is naming: without a promotion workflow, only a
+        recorded source SHA plus an existing source branch verifies lineage. An
+        unrelated promote-prefixed PR is never ranked."""
+        search = {'total_count': 1, 'incomplete_results': False, 'items': [
+            {'number': 99, 'html_url': promotion_node()['url'],
+             'title': 'promote-experiment',
+             'repository_url': 'https://api.github.com/repos/commercebuildteam/client-site',
+             'updated_at': '2026-10-15T10:00:00Z', 'user': {'login': 'bhalecb'},
+             'draft': False}]}
+        details = {'99': dict(promotion_node(), title='promote-experiment',
+                              url=promotion_node()['url'])}
+        with mock.patch.object(promotion_source.subprocess, 'run', self.fake_gh(
+                {**search, 'details': details})):
+            result = promotion_source.collect(self.state)
+        self.assertEqual(result['items'], [])
+        self.assertIn(promotion_node()['url'], result['unverified'])
+        # With a recorded source SHA and an existing source branch it classifies.
+        details['99'] = dict(details['99'], body='Prepared from source 04d12f0abc.')
+        cached = json.loads((self.state / 'promotion-snapshot.json').read_text())
+        cached['captured_at'] = '2020-01-01T00:00:00+00:00'
+        (self.state / 'promotion-snapshot.json').write_text(json.dumps(cached))
+        with mock.patch.object(promotion_source.subprocess, 'run', self.fake_gh(
+                {**search, 'details': details, 'source_branch': 'master'})):
+            result = promotion_source.collect(self.state)
+        self.assertEqual(len(result['items']), 1)
+        self.assertEqual(result['items'][0]['lineage']['kind'], 'source-record')
 
     def test_second_refresh_drops_a_merged_promotion(self):
         url = promotion_node()['url']
@@ -175,11 +215,13 @@ class PromotionCollection(unittest.TestCase):
         details = {'99': dict(promotion_node(), url=url_a)}
         (self.state / 'promotion-snapshot.json').write_text(json.dumps(
             {'captured_at': '2020-01-01T00:00:00+00:00',
-             'items': [{'url': url_a, 'priority': 'Promotion'},
-                       {'url': url_b, 'priority': 'Promotion'}],
+             'items': [{'url': url_a, 'priority': 'Promotion',
+                        'lineage': {'kind': 'promotion-workflow', 'verified': True}},
+                       {'url': url_b, 'priority': 'Promotion',
+                        'lineage': {'kind': 'promotion-workflow', 'verified': True}}],
              'errors': [], 'last_success_at': '2026-10-15T08:00:00Z'}))
         with mock.patch.object(promotion_source.subprocess, 'run', self.fake_gh(
-                {**search, 'details': details})), \
+                {**search, 'details': details, 'workflow': True})), \
              mock.patch.object(promotion_source, 'MAX_DETAIL_PER_REFRESH', 1):
             result = promotion_source.collect(self.state)
         urls = {i['url'] for i in result['items']}
@@ -516,6 +558,169 @@ class MergedEvidenceAndDispatch(unittest.TestCase):
             review_intake.start(self.state)
             review_intake.start(self.state)
         self.assertEqual(len(started), 1)
+
+
+class ReviewerRoutingAndCapacity(unittest.TestCase):
+    """Review-round integration coverage: reviewer identity routing, full-capacity
+    durable intake, the Donavon HIGH floor, linked-issue requests, promotion
+    lineage, and the independent freshness loop."""
+
+    def setUp(self):
+        self.state = Path(tempfile.mkdtemp())
+
+    def _module(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            'swarm_opencode_under_test_' + str(id(self)),
+            Path(__file__).resolve().parent.parent / 'scripts' / 'swarm-opencode.py')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.STATE = self.state
+        return module
+
+    def test_review_items_route_to_reviewer_agent_and_prompt(self):
+        module = self._module()
+        self.assertEqual(module.agent_for_entry({'kind': 'review'}), module.REVIEWER_AGENT)
+        self.assertEqual(module.agent_for_entry({}), module.DEVELOPER_AGENT)
+        path = module.write_prompt('w-r-1', 'commercebuildteam/r', DONAVON_PR, 'Fix',
+                                   mode='review')
+        text = path.read_text()
+        self.assertIn('reviewer-only', text)
+        self.assertIn('approval, merge', text.lower())
+        self.assertNotIn('request my review', text)
+        # The developer dispatch instructions must not appear in a review prompt.
+        self.assertNotIn('push only', text)
+
+    def test_full_capacity_records_reviews_durably(self):
+        """A Donavon request arriving while every slot is claimed still enters the
+        durable pending queue within one refresh, with no claim bound."""
+        module = self._module()
+        module.QUEUE_PATH = self.state / 'dispatch' / 'queue.json'
+        module.archived_repos = lambda: set()
+        (self.state / 'review-intake.json').write_text(json.dumps({'items': [
+            {'url': DONAVON_PR, 'title': 'Fix thing', 'donavon_request': True,
+             'priority': 'High', 'updated_at': '2026-10-15T11:00:00Z'}]}))
+        recorded = module.record_high_tier('session-x')
+        self.assertEqual(len(recorded), 1)
+        entries = module.read_queue()
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]['state'], 'pending')
+        self.assertEqual(entries[0]['kind'], 'review')
+        self.assertEqual(entries[0]['claim_id'], '')
+        self.assertEqual(entries[0]['issue'], DONAVON_PR)
+        self.assertTrue((self.state / 'dispatch' / (recorded[0]['worker_id'] + '.md')).exists())
+        # A second pass at full capacity does not duplicate the entry.
+        self.assertEqual(module.record_high_tier('session-x'), [])
+        self.assertEqual(len(module.read_queue()), 1)
+
+    def test_direct_intake_at_zero_limit_records_high_tier(self):
+        module = self._module()
+        sentinel = [{'worker_id': 'w-x'}]
+        with mock.patch.object(module, 'record_high_tier',
+                               mock.Mock(return_value=sentinel)) as recorder:
+            self.assertEqual(module.direct_intake('session-x', limit=0), sentinel)
+        recorder.assert_called_once_with('session-x')
+
+    def test_freshness_loop_refreshes_during_a_long_round(self):
+        """The independent poller refreshes promotions and priorities while a
+        dispatch round runs long; freshness evidence is recorded each cycle."""
+        module = self._module()
+        calls = []
+        stop = threading.Event()
+        with mock.patch.object(module.priority_schedule, 'refresh',
+                               lambda *a, **k: calls.append('priority')), \
+             mock.patch.object(module.promotion_source, 'collect',
+                               lambda *a: calls.append('promotions')), \
+             mock.patch.object(module.review_intake, 'refresh',
+                               lambda *a: calls.append('review_intake')):
+            thread = threading.Thread(target=module.freshness_loop, args=(stop, 0.2),
+                                      daemon=True)
+            thread.start()
+            time.sleep(0.7)  # simulate a long-running dispatch round
+            stop.set()
+            thread.join(timeout=2)
+        self.assertGreaterEqual(calls.count('promotions'), 2)
+        self.assertGreaterEqual(calls.count('priority'), 2)
+        status = json.loads((self.state / 'freshness-status.json').read_text())
+        self.assertTrue(status['ok'])
+
+
+class LinkedIssueAndPriorityFloors(unittest.TestCase):
+    def setUp(self):
+        self.state = Path(tempfile.mkdtemp())
+
+    def test_high_floor_over_medium_linked_ticket(self):
+        pr = DONAVON_PR
+        (self.state / 'priority-snapshot.json').write_text(json.dumps(
+            {'captured_at': '2026-10-15T10:00:00Z',
+             'items': [{'url': pr, 'priority': 'Medium'}]}))
+        (self.state / 'review-intake.json').write_text(json.dumps(
+            {'items': [{'url': pr, 'donavon_request': True, 'priority': 'High'}]}))
+        merged = priority_schedule.merged_snapshot(self.state)
+        row = next(i for i in merged['items'] if i['url'] == pr)
+        self.assertEqual(row['priority'], 'High')
+        self.assertIn('floor', row['priority_reason'])
+
+    def test_urgent_stays_above_the_high_floor(self):
+        pr = DONAVON_PR
+        (self.state / 'priority-snapshot.json').write_text(json.dumps(
+            {'captured_at': '2026-10-15T10:00:00Z',
+             'items': [{'url': pr, 'priority': 'Urgent'}]}))
+        (self.state / 'review-intake.json').write_text(json.dumps(
+            {'items': [{'url': pr, 'donavon_request': True, 'priority': 'High'}]}))
+        merged = priority_schedule.merged_snapshot(self.state)
+        row = next(i for i in merged['items'] if i['url'] == pr)
+        self.assertEqual(row['priority'], 'Urgent')
+
+    def test_priority_source_searches_review_requested_prs(self):
+        """Linked-ticket priority must reach PRs by any author that Donavon asked
+        bhalecb to review, not only commercebuild- or Donavon-authored PRs."""
+        queries = []
+
+        def fake_query(q):
+            queries.append(q)
+            return {'search': {'nodes': [], 'pageInfo': {'hasNextPage': False}}}
+
+        with mock.patch.object(priority_source, 'query', fake_query):
+            priority_source.collect(self.state)
+        joined = ' '.join(queries)
+        self.assertIn('review-requested:bhalecb', joined)
+        self.assertIn('review-requested:commercebuild', joined)
+
+    def test_explicit_request_in_a_linked_issue_qualifies(self):
+        """A Donavon review request posted on a verified linked issue is a required
+        intake source, not only requests in PR comments."""
+        issue_url = 'https://github.com/commercebuildteam/r/issues/7'
+        node = {'url': DONAVON_PR, 'title': 'Fix thing', 'updatedAt': '2026-10-15T11:00:00Z',
+                'headRefOid': 'a' * 40, 'isDraft': False,
+                'author': {'login': 'someone-else'},
+                'assignees': {'nodes': []}, 'reviewRequests': {'nodes': []},
+                'closingIssuesReferences': {'nodes': [{'url': issue_url}]},
+                'timelineItems': {'pageInfo': {'hasPreviousPage': False}, 'nodes': []}}
+
+        def fake_run(command, **kwargs):
+            joined = ' '.join(command)
+            if 'graphql' in joined:
+                payload = {'data': {'search': {'pageInfo': {'hasNextPage': False},
+                                               'nodes': [node]}}}
+                return mock.Mock(returncode=0, stdout=json.dumps(payload), stderr='')
+            if '/comments' in joined:
+                body = [{'id': 5, 'user': {'login': 'donavon-commercebuild'},
+                         'body': '@bhalecb can you review this one please?',
+                         'created_at': '2026-10-15T12:00:00Z'}] \
+                    if '/issues/7/' in joined else []
+                return mock.Mock(returncode=0, stdout=json.dumps(body), stderr='')
+            raise AssertionError('unexpected call: %r' % (command[:3],))
+
+        with mock.patch.object(review_intake.subprocess, 'run', fake_run):
+            review_intake.refresh(self.state)
+        items = review_intake.snapshot(self.state).get('items', [])
+        self.assertEqual([i for i in items if i['url'] == DONAVON_PR and
+                          i.get('donavon_request')], [i for i in items
+                                                      if i['url'] == DONAVON_PR])
+        item = next(i for i in items if i['url'] == DONAVON_PR)
+        self.assertEqual(item['priority'], 'High')
+        self.assertIn('comment', item['request_evidence'][0]['kind'])
 
 
 if __name__ == '__main__':

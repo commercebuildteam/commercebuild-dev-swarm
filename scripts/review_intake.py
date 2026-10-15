@@ -6,8 +6,10 @@ TARGETS={'bhalecb','commercebuild'}
 # explicit review request addressed to him, from donavon-commercebuild himself.
 EXPLICIT_REQUEST=re.compile(r'(?i)\b(?:please\s+|kindly\s+|can\s+you\s+|could\s+you\s+|request(?:ing|ed)?\s+(?:a\s+)?)review\b')
 COMMENT_SCAN_BUDGET=25
+ISSUE_SCAN_BUDGET=25
 FRAGMENT='''... on PullRequest { url title updatedAt headRefOid isDraft author{login}
  assignees(first:30){nodes{login}} reviewRequests(first:30){nodes{requestedReviewer{... on User{login}}}}
+ closingIssuesReferences(first:20){nodes{url}}
  timelineItems(last:100,itemTypes:[REVIEW_REQUESTED_EVENT]){pageInfo{hasPreviousPage} nodes{
  ... on ReviewRequestedEvent{createdAt actor{login} requestedReviewer{... on User{login}}}}}}'''
 def explicit_comment_requests(comments):
@@ -23,8 +25,8 @@ def explicit_comment_requests(comments):
   found.append({'kind':'comment','id':str(comment.get('id') or ''),'created_at':comment.get('created_at') or ''})
  return found
 def comments_for(url):
- """Bounded recent comment fetch for one PR; explicit request evidence only."""
- match=re.fullmatch(r'https://github\.com/(commercebuildteam/[\w.-]+)/pull/(\d+)',url or '')
+ """Bounded recent comment fetch for one PR or issue; explicit request evidence only."""
+ match=re.fullmatch(r'https://github\.com/(commercebuildteam/[\w.-]+)/(?:pull|issues)/(\d+)',url or '')
  if not match:return []
  p=subprocess.run(['gh','api','--method','GET',f'repos/{match.group(1)}/issues/{match.group(2)}/comments',
                    '-f','per_page=50','--jq','[.[] | {id,user:.user.login,body,created_at}]'],
@@ -102,12 +104,20 @@ def refresh(state):
    try:priorities={i['url']:i.get('priority') for i in json.loads((state/'priority-snapshot.json').read_text())['items']}
    except (OSError,ValueError,KeyError):priorities={}
    ranks={'Urgent':1,'High':2,'Medium':3,'Low':4}
-   budget=COMMENT_SCAN_BUDGET
+   budget=COMMENT_SCAN_BUDGET;issue_budget=ISSUE_SCAN_BUDGET
    for n in nodes.values():
     comment_evidence=[]
     if budget>0:
      budget-=1
      try:comment_evidence=explicit_comment_requests(comments_for(n['url']))
+     except (RuntimeError,subprocess.TimeoutExpired,ValueError) as ce:
+      result['errors'].append(str(ce) if isinstance(ce,RuntimeError) else type(ce).__name__)
+    # Explicit requests can live in verified linked issues, not only PR comments.
+    for issue_ref in (n.get('closingIssuesReferences') or {}).get('nodes') or []:
+     issue_url=(issue_ref or {}).get('url') or ''
+     if not issue_url or issue_budget<=0:continue
+     issue_budget-=1
+     try:comment_evidence.extend(explicit_comment_requests(comments_for(issue_url)))
      except (RuntimeError,subprocess.TimeoutExpired,ValueError) as ce:
       result['errors'].append(str(ce) if isinstance(ce,RuntimeError) else type(ce).__name__)
     item=classify(n,comment_evidence)
