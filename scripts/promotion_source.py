@@ -1,0 +1,214 @@
+"""Promotion discovery, classification, and durable snapshot; evidence only.
+
+Promotions are the highest scheduling tier, above every ticket priority. Discovery
+covers all accessible non-archived commercebuildteam repositories without requiring
+assignment, a review request, or a label. Every classified promotion records verified
+branch source/target evidence, and blocked promotions stay visible with their next
+owner and recheck condition. This module never writes to GitHub or the queue.
+"""
+import datetime
+import json
+import pathlib
+import re
+import subprocess
+
+RANK = {'Promotion': 0}
+REFRESH_SECONDS = 60
+MAX_SEARCH_PAGES = 3
+MAX_DETAIL_PER_REFRESH = 25
+
+# A promotion PR targets a release or stable branch. Both channels take precedence.
+PROMO_TARGET = re.compile(r'^(release(?:/.+)?|stable(?:/.+)?)$', re.IGNORECASE)
+# The head is the default branch, a promotion-prepared branch, or an encoded/custom name.
+DEFAULT_HEAD = re.compile(r'^(main|master|develop|trunk)$', re.IGNORECASE)
+PREPARED_HEAD = re.compile(r'^(cb-promotion|promotion-prepare|promote)', re.IGNORECASE)
+# Encoded/custom heads carry percent- or percent-encoded release names, or arbitrary
+# custom tokens instead of a plain branch word.
+ENCODED_HEAD = re.compile(r'%[0-9a-fA-F]{2}|[A-Za-z0-9]+-[0-9a-f]{8,}', re.IGNORECASE)
+REPLACEMENT = re.compile(r'replacement', re.IGNORECASE)
+PROMO_TITLE = re.compile(r'\bpromot\w*\b|\brelease\s+v?\d+\.\d+', re.IGNORECASE)
+BOT_LOGINS = {'commercebuild', 'github-actions', 'commercebuild-bot'}
+
+
+def rank_of(priority):
+    return RANK.get(priority, 5)
+
+
+def is_bot(author):
+    login = (author or {}).get('login') or ''
+    return login.lower() in BOT_LOGINS or login.endswith('[bot]')
+
+
+def gh(*args, timeout=25):
+    result = subprocess.run(['gh', *args], check=True, capture_output=True,
+                            text=True, timeout=timeout)
+    return json.loads(result.stdout)
+
+
+def search_open_prs():
+    """Bounded, paginated open-PR search across all non-archived org repositories."""
+    rows, cursor = [], None
+    for _ in range(MAX_SEARCH_PAGES):
+        command = ['gh', 'api', '--method', 'GET', 'search/issues', '-f',
+                   'q=org:commercebuildteam is:pr is:open archived:false',
+                   '-f', 'sort=updated', '-f', 'order=desc', '-f', 'per_page=100']
+        if cursor:
+            command += ['-f', f'page={cursor}']
+        data = gh(*command)
+        if data.get('incomplete_results'):
+            raise RuntimeError('GitHub promotion search returned incomplete results')
+        rows.extend(data['items'])
+        if len(rows) >= data['total_count'] or not data['items']:
+            break
+        cursor = len(rows) // 100 + 1
+    result = []
+    for item in rows:
+        repo = '/'.join(item['repository_url'].split('/')[-2:])
+        result.append({'url': item['html_url'], 'number': item['number'],
+                       'repo': repo, 'title': item['title'], 'updatedAt': item['updated_at'],
+                       'author': (item.get('user') or {}).get('login') or '',
+                       'draft': bool(item.get('draft'))})
+    return result
+
+
+def pr_detail(repo, number):
+    """Branch source/target, draft, author, and merge state for one PR."""
+    data = gh('api', f'repos/{repo}/pulls/{number}', '--jq',
+              '{head: .head.ref, base: .base.ref, draft: .draft, state: .state, '
+              'author: .user.login, mergeable: .mergeable_state, title: .title, '
+              'body: (.body // "")}')
+    return data
+
+
+def branch_evidence(detail):
+    """Verified promotion branch structure: a release/stable target with a
+    promotion-prepared, default, encoded/custom, or replacement head."""
+    base = (detail.get('base') or '').strip()
+    head = (detail.get('head') or '').strip()
+    if not PROMO_TARGET.match(base):
+        return None
+    kinds = []
+    if DEFAULT_HEAD.match(head):
+        kinds.append('default-head')
+    if PREPARED_HEAD.match(head):
+        kinds.append('promotion-prepared')
+    if ENCODED_HEAD.search(head):
+        kinds.append('encoded-custom-head')
+    if not kinds:
+        return None
+    return {'head': head, 'base': base, 'head_kinds': kinds}
+
+
+def classify(detail):
+    """Return a promotion item, or None when the PR is not a promotion.
+
+    A PR that merely mentions 'promotion' with a non-promotion target branch is
+    explicitly not classified; negative classification is part of the contract.
+    """
+    evidence = branch_evidence(detail)
+    if evidence is None:
+        return None
+    body = detail.get('body') or ''
+    item = {
+        'url': detail['url'], 'title': detail.get('title') or '', 'kind': 'promotion',
+        'priority': 'Promotion', 'branch_evidence': evidence,
+        'bot_authored': is_bot({'login': detail.get('author')}),
+        'draft': bool(detail.get('draft')),
+        'replacement_branch': bool(REPLACEMENT.search(detail.get('head') or '')
+                                   or REPLACEMENT.search(body)),
+        'stable_channel': bool(re.match(r'^stable', evidence['base'], re.IGNORECASE)),
+        'mergeable': detail.get('mergeable') or 'unknown',
+        'updatedAt': detail.get('updatedAt') or '',
+        'verified_at': detail.get('verified_at') or '',
+    }
+    blocked = []
+    if item['draft']:
+        blocked.append('draft PR: hold until marked ready')
+    if item['mergeable'] in ('dirty', 'blocked', 'unstable'):
+        blocked.append(f'not safely mergeable ({item["mergeable"]})')
+    item['blocked'] = blocked
+    # Promotion repairs that need code changes go to donavon-commercebuild, never
+    # commercebuild. Review/hold observation stays with bhalecb.
+    item['next_owner'] = 'donavon-commercebuild' if item['mergeable'] == 'dirty' else 'bhalecb'
+    item['recheck_condition'] = ('branch source/target changes, checks complete, or hold release'
+                                 if blocked else 'head changes or promotion merges')
+    return item
+
+
+def snapshot(state):
+    try:
+        return json.loads((pathlib.Path(state) / 'promotion-snapshot.json').read_text())
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def collect(state):
+    """Refresh the promotion snapshot with a 60-second cache; on failure keep the
+    previous items and record the error so freshness is never silently lost."""
+    path = pathlib.Path(state) / 'promotion-snapshot.json'
+    now = datetime.datetime.now(datetime.timezone.utc)
+    old = snapshot(state)
+    try:
+        captured = datetime.datetime.fromisoformat(old['captured_at'])
+        if (now - captured).total_seconds() < REFRESH_SECONDS:
+            return old
+    except (KeyError, ValueError, TypeError):
+        pass
+    result = {'captured_at': now.isoformat(), 'interval_seconds': REFRESH_SECONDS,
+              'items': old.get('items') or [], 'errors': [], 'truncated': False,
+              'unverified': {}}
+    try:
+        rows = search_open_prs()
+        candidates = []
+        for row in rows:
+            # Cheap branch-agnostic title filter first; verification decides.
+            if PROMO_TITLE.search(row['title'] or ''):
+                candidates.append(row)
+        detail_budget = MAX_DETAIL_PER_REFRESH
+        for row in candidates:
+            if detail_budget <= 0:
+                result['unverified'][row['url']] = 'detail verification deferred to the next refresh'
+                continue
+            detail_budget -= 1
+            try:
+                detail = pr_detail(row['repo'], row['number'])
+                detail.update({'url': row['url'], 'updatedAt': row['updatedAt'],
+                               'verified_at': now.isoformat()})
+                item = classify(detail)
+            except (subprocess.SubprocessError, ValueError, OSError, KeyError) as exc:
+                result['errors'].append(f'{row["url"]}: {type(exc).__name__}')
+                continue
+            if item:
+                # Replace any prior record for the same PR; dedupe by URL.
+                result['items'] = [i for i in result['items'] if i['url'] != item['url']]
+                result['items'].append(item)
+        result['truncated'] = detail_budget <= 0
+    except (subprocess.SubprocessError, RuntimeError, ValueError, OSError) as exc:
+        result['errors'].append(str(exc) if isinstance(exc, RuntimeError) else type(exc).__name__)
+        # Rate limiting and permission failures keep last-known items visible.
+        result['last_success_at'] = old.get('last_success_at')
+    else:
+        result['last_success_at'] = now.isoformat()
+    tmp = path.with_suffix('.tmp')
+    tmp.write_text(json.dumps(result, indent=2))
+    tmp.replace(path)
+    return result
+
+
+def items(state):
+    return snapshot(state).get('items') or []
+
+
+def merge_into(snapshot_data, state):
+    """Merge promotion items into a priority-snapshot-shaped mapping for ordering."""
+    snapshot_data = dict(snapshot_data)
+    known = {i['url'] for i in snapshot_data.get('items') or []}
+    snapshot_data['items'] = list(snapshot_data.get('items') or []) + \
+        [i for i in items(state) if i['url'] not in known]
+    return snapshot_data
+
+
+if __name__ == '__main__':
+    data = collect(pathlib.Path(__file__).parent)
+    print(json.dumps({k: v for k, v in data.items() if k != 'items'}, indent=2))
+    print(json.dumps(data.get('items'), indent=2))
