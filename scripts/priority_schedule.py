@@ -19,9 +19,8 @@ def refresh(state,background=True):
  def run():
   try:
    old=snapshot(state);new=collect(state)
-   # Promotions ride the same 60-second cadence and merge into the shared snapshot
-   # so ordering sees them as the top tier without a second lock or file race.
-   promotion_source.collect(state)
+   # Promotion discovery has its own 60-second loop in the launcher so a slow ticket
+   # refresh never delays it; merged_snapshot() reads its snapshot for ordering.
    if new.get('errors') and old.get('items'):
     # Preserve last-known ordering on transient API errors; show freshness/error.
     new['items']=old['items'];new['last_success_at']=old.get('last_success_at',old.get('captured_at'))
@@ -68,8 +67,13 @@ def merged_snapshot(state):
         if merged['priority']==floor and floor and floor!=existing.get('priority')
         else existing.get('priority_reason') or item.get('priority_reason'))
    rows[url]=merged
- # Promotion evidence supersedes everything for its URL: promotions outrank all.
- rows.update({i['url']:i for i in promotion_source.items(state)})
+ # Verified promotion evidence supersedes everything for its URL: promotions outrank
+ # all. An unverified-lineage promotion or an unclassified discovery candidate only
+ # fills a URL that has no row yet, so it never lowers a ticket or review priority.
+ for i in promotion_source.items(state):
+  if not i.get('unverified') or i['url'] not in rows:rows[i['url']]=i
+ for i in promotion_source.candidates(state):
+  rows.setdefault(i['url'],i)
  data['items']=list(rows.values())
  return data
 

@@ -679,32 +679,52 @@ def poll_loop(stop, interval=60):
         deadline = max(deadline + interval, time.monotonic() + min(1, interval))
 
 
-def freshness_loop(stop, interval=60):
-    """Independent 60-second promotion and ticket-priority refresh.
-
-    priority_schedule.refresh is cached and internally rate-limited, and promotion
-    discovery rides the same cadence. A long or idle dispatch round must not miss
-    the discovery deadline, so this loop runs outside the round and records bounded
+def run_cadence(stop, interval, tasks, status_name):
+    """Run tasks in order every interval seconds (start to start) and record bounded
     freshness evidence instead of raising into the dispatch path."""
     deadline = time.monotonic() + interval
     while not stop.wait(max(0, deadline - time.monotonic())):
         errors, seconds = {}, {}
-        for name, task in (('priority', lambda: priority_schedule.refresh(STATE, background=False)),
-                           ('promotions', lambda: promotion_source.collect(STATE)),
-                           ('review_intake', lambda: review_intake.refresh(STATE)),
-                           # The poller also inserts newly discovered requests into the
-                           # durable pending queue, so a request arriving during a long
-                           # full pool never waits for a free slot to become visible.
-                           ('queue_intake', lambda: record_high_tier(None))):
+        for name, task in tasks:
             began = time.monotonic()
             try:
                 task()
             except Exception as exc:
                 errors[name] = type(exc).__name__
             seconds[name] = round(time.monotonic() - began, 3)
-        atomic(STATE / 'freshness-status.json', {'completed_at': stamp(), 'ok': not errors,
-                                                 'errors': errors, 'seconds': seconds})
+        atomic(STATE / status_name, {'completed_at': stamp(), 'ok': not errors,
+                                     'errors': errors, 'seconds': seconds})
         deadline = max(deadline + interval, time.monotonic() + min(1, interval))
+
+
+def promotion_intake_loop(stop, interval=60):
+    """Dedicated 60-second promotion discovery and durable queue insertion.
+
+    Promotion discovery runs on its own thread so ticket-priority and review-intake
+    refreshes can never delay it. Each cycle is discovery, hard-bounded by
+    promotion_source.DISCOVERY_SECONDS (search included, nothing awaited past it),
+    followed immediately by queue insertion, so a promotion found by the search is
+    queued in the same cycle."""
+    run_cadence(stop, interval,
+                (('promotions', lambda: promotion_source.collect(STATE)),
+                 ('queue_intake', lambda: record_high_tier(None))),
+                'promotion-intake-status.json')
+
+
+def freshness_loop(stop, interval=60):
+    """Independent 60-second ticket-priority and review-intake refresh.
+
+    priority_schedule.refresh is cached and internally rate-limited. A long or idle
+    dispatch round must not miss the refresh, so this loop runs outside the round.
+    Promotions have their own loop (promotion_intake_loop)."""
+    run_cadence(stop, interval,
+                (('priority', lambda: priority_schedule.refresh(STATE, background=False)),
+                 ('review_intake', lambda: review_intake.refresh(STATE)),
+                 # The poller also inserts newly discovered requests into the
+                 # durable pending queue, so a request arriving during a long
+                 # full pool never waits for a free slot to become visible.
+                 ('queue_intake', lambda: record_high_tier(None))),
+                'freshness-status.json')
 
 
 BLOCKED_RE = re.compile(
@@ -957,7 +977,8 @@ def review_posted_on_head(url, head, since):
                 if head and row.get('commit_id') == head:
                     return True
             elif head and REVIEW_RESULT_RE.search(row.get('body') or '') \
-                    and str(head) in (row.get('body') or ''):
+                    and re.search(r'(?<![0-9a-fA-F])' + re.escape(str(head)) + r'(?![0-9a-fA-F])',
+                                  row.get('body') or ''):
                 # The exact full 40-character head SHA, not a prefix: a comment
                 # naming a different commit that shares the short SHA proves
                 # nothing about this head.
@@ -1452,6 +1473,7 @@ def dispatch_round(args, model, session):
     """Keep up to SLOTS workers live, refill a slot as soon as it frees, and end the
     round only when nothing is running, nothing is pending, and intake found nothing."""
     priority_schedule.refresh(STATE, background=False)
+    promotion_source.collect(STATE)
     # The review-intake poller starts with dispatch too, not only the dashboard
     # server, so a Donavon request is queued even when nobody is watching the page.
     review_intake.start(STATE)
@@ -1930,8 +1952,9 @@ def interleave_work_lanes(owed, recovery, new):
 
 def review_entry_urls(state):
     """URLs that dispatch as reviewer-only jobs: Donavon-requested reviews and
-    promotions whose next owner is bhalecb, including candidates still unverified
-    by this refresh. Promotion repairs that need a verified source change stay
+    classified promotions whose next owner is bhalecb, including those whose lineage
+    is still unverified. Unclassified discovery candidates are never included.
+    Promotion repairs that need a verified source change stay
     with donavon-commercebuild and are never dispatched as developer
     implementation work by this swarm."""
     urls = {i['url'] for i in review_intake.snapshot(state).get('items', [])
@@ -1999,8 +2022,8 @@ def issue_requires_reassessment(item):
 def record_high_tier(session):
     """Capacity-independent durable queue insertion for review-tier items.
 
-    Donavon-requested reviews, verified promotions, and promotion candidates
-    still unverified by this refresh must stay queued and visible while every
+    Donavon-requested reviews, verified promotions, and classified promotions whose
+    lineage is still unverified must stay queued and visible while every
     developer slot is claimed; the two-concurrent review cap remains a
     dispatch-time check, so freeing a slot starts an already-queued review without
     re-discovery. Unverified candidates queue at a safe bottom-tier priority and
@@ -2056,6 +2079,7 @@ def direct_intake(session, limit=SLOTS, assignee=DEFAULT_ASSIGNEE):
         # capacity: the requests enter the durable pending queue anyway.
         return record_high_tier(session)
     priority_schedule.refresh(STATE, background=False)
+    promotion_source.collect(STATE)
     rows, seen_urls = [], set()
     searches = (('issues', ['--assignee', assignee]),
                 ('prs', ['--assignee', assignee]),
@@ -2449,6 +2473,9 @@ def run_round(args, final_status='stopped'):
         freshness = threading.Thread(target=freshness_loop, args=(stop,), daemon=True,
                                      name='freshness-poller')
         freshness.start()
+        promotions = threading.Thread(target=promotion_intake_loop, args=(stop,),
+                                      daemon=True, name='promotion-intake')
+        promotions.start()
         try:
             # GitHub assignment discovery is deterministic and should not wait for
             # an LLM coordinator. Use the assignee's open issues and PRs first.

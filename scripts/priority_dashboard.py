@@ -5,6 +5,10 @@ RANK={'Promotion':0,'Urgent':1,'High':2,'Medium':3,'Low':4}
 def esc(x):return html.escape(str(x or ''),quote=True)
 def status(item,entries,live,claims,owners,paused):
  url=item['url'];related={url,*item.get('linked_issues',[])}
+ if item.get('kind')=='promotion-candidate':  # unclassified: visible, never queued
+  text='Promotion discovery deferred - '+('; '.join(item.get('blocked') or []))
+  if item.get('recheck_condition'):text+='<br><small>Recheck: '+esc(item['recheck_condition'])+'</small>'
+  return text
  if item.get('next_owner'):  # promotion row: visible owner, hold evidence, recheck condition
   text='Promotion: next owner '+item['next_owner']
   if item.get('blocked'):text+=' - '+('; '.join(item['blocked']))

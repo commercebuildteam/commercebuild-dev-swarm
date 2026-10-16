@@ -36,6 +36,21 @@ def promotion_node(base='release', head='cb-promotion/release-3.4', author='comm
             'verified_at': '2026-10-15T10:00:00Z'}
 
 
+def listing_response(joined, details):
+    """Fake per-repository open-PR listing built from the per-PR detail fixtures:
+    the list endpoint carries branch refs but no merge state."""
+    match = re.search(r'repos/([^/\s]+/[^/\s]+)/pulls(?:\s|$)', joined)
+    if not match:
+        return None
+    page = int(re.search(r'(?<![_\w])page=(\d+)', joined).group(1))
+    repo = match.group(1)
+    rows = [dict({k: v for k, v in detail.items() if k != 'mergeable'}, number=int(number))
+            for number, detail in details.items()
+            if f'/{repo}/pull/' in (detail.get('url') or '')]
+    rows = rows[(page - 1) * 100:page * 100]
+    return mock.Mock(returncode=0, stdout=json.dumps(rows), stderr='')
+
+
 class PromotionClassification(unittest.TestCase):
     def test_verified_promotion_classifies_above_all(self):
         item = promotion_source.classify(promotion_node())
@@ -95,6 +110,9 @@ class PromotionCollection(unittest.TestCase):
             joined = ' '.join(command)
             if 'search/issues' in joined:
                 return mock.Mock(returncode=0, stdout=json.dumps(searches), stderr='')
+            listed = listing_response(joined, searches['details'])
+            if listed:
+                return listed
             if '/pulls/' in joined:
                 number = re.search(r'/pulls/(\d+)', joined).group(1)
                 detail = dict(searches['details'][number])
@@ -238,7 +256,7 @@ class PromotionCollection(unittest.TestCase):
     def test_linked_release_evidence_verifies_lineage(self):
         """A promotion PR body linking an existing release tag is lineage evidence
         only when the tag's commit belongs to the direction's source branch and
-        is contained in this PR's head commit."""
+        is exactly this PR's head commit."""
         url = promotion_node()['url']
         search = {'total_count': 1, 'incomplete_results': False, 'items': [
             {'number': 99, 'html_url': url, 'title': 'Promotion: release 3.4',
@@ -250,6 +268,9 @@ class PromotionCollection(unittest.TestCase):
             joined = ' '.join(command)
             if 'search/issues' in joined:
                 return mock.Mock(returncode=0, stdout=json.dumps(search), stderr='')
+            listed = listing_response(joined, searches['details'])
+            if listed:
+                return listed
             if '/pulls/' in joined:
                 number = re.search(r'/pulls/(\d+)', joined).group(1)
                 return mock.Mock(returncode=0,
@@ -259,9 +280,11 @@ class PromotionCollection(unittest.TestCase):
             if '/releases/tags/' in joined:
                 return mock.Mock(returncode=0, stdout='"v3.4.0"', stderr='')
             if '/compare/' in joined:
-                # The tag commit must be on the promotion's source branch and
-                # contained in this PR's head commit.
-                if '...main' in joined or '...' + 'a' * 40 in joined:
+                # The tag commit must be on the promotion's source branch and be
+                # exactly this PR's head commit.
+                if '...' + 'a' * 40 in joined:
+                    return mock.Mock(returncode=0, stdout='"identical"', stderr='')
+                if '...main' in joined:
                     return mock.Mock(returncode=0, stdout='"ahead"', stderr='')
                 return mock.Mock(returncode=0, stdout='"diverged"', stderr='')
             raise AssertionError('unexpected gh call: %r' % (command[:6],))
@@ -288,6 +311,9 @@ class PromotionCollection(unittest.TestCase):
             joined = ' '.join(command)
             if 'search/issues' in joined:
                 return mock.Mock(returncode=0, stdout=json.dumps(search), stderr='')
+            listed = listing_response(joined, searches['details'])
+            if listed:
+                return listed
             if '/pulls/' in joined:
                 number = re.search(r'/pulls/(\d+)', joined).group(1)
                 return mock.Mock(returncode=0,
@@ -324,6 +350,9 @@ class PromotionCollection(unittest.TestCase):
             joined = ' '.join(command)
             if 'search/issues' in joined:
                 return mock.Mock(returncode=0, stdout=json.dumps(search), stderr='')
+            listed = listing_response(joined, searches['details'])
+            if listed:
+                return listed
             if '/pulls/' in joined:
                 number = re.search(r'/pulls/(\d+)', joined).group(1)
                 return mock.Mock(returncode=0,
@@ -364,6 +393,9 @@ class PromotionCollection(unittest.TestCase):
             joined = ' '.join(command)
             if 'search/issues' in joined:
                 return mock.Mock(returncode=0, stdout=json.dumps(search), stderr='')
+            listed = listing_response(joined, searches['details'])
+            if listed:
+                return listed
             if '/pulls/' in joined:
                 number = re.search(r'/pulls/(\d+)', joined).group(1)
                 return mock.Mock(returncode=0,
@@ -402,6 +434,9 @@ class PromotionCollection(unittest.TestCase):
             joined = ' '.join(command)
             if 'search/issues' in joined:
                 return mock.Mock(returncode=0, stdout=json.dumps(search), stderr='')
+            listed = listing_response(joined, searches['details'])
+            if listed:
+                return listed
             if '/pulls/' in joined:
                 number = re.search(r'/pulls/(\d+)', joined).group(1)
                 return mock.Mock(returncode=0,
@@ -469,10 +504,12 @@ class PromotionCollection(unittest.TestCase):
             {url_a, url_b})
         self.assertEqual(second['unverified'], {})
 
-    def test_deferred_candidate_beyond_detail_budget_stays_visible(self):
-        """A new custom promotion after 200 ordinary open PRs is deferred by this
-        refresh's budget but stays individually visible in unverified, so its
-        blocked state and recheck condition surface while verification continues."""
+    def test_promotion_after_200_open_prs_is_classified_in_one_refresh(self):
+        """A new custom promotion after 200 ordinary open PRs is classified in the
+        first refresh: classification lists each repository's open PRs with their
+        branch refs, so there is no per-PR budget to defer it. It becomes a visible
+        blocked row with its branch evidence and a safe bottom-tier priority, the
+        dashboard merge shows it, and only the promotion gets a per-PR call."""
         promo_url = 'https://github.com/commercebuildteam/client-site/pull/201'
         search = {'total_count': 201, 'incomplete_results': False, 'items': []}
         details = {}
@@ -497,11 +534,16 @@ class PromotionCollection(unittest.TestCase):
                                         'head_repo': 'commercebuildteam/client-site',
                                         'draft': False, 'mergeable': 'clean',
                                         'author': 'bhalecb', 'body': '', 'title': 'Update deps'}
+        calls = []
 
         def run(command, **kwargs):
             joined = ' '.join(command)
+            calls.append(joined)
             if 'search/issues' in joined:
                 return mock.Mock(returncode=0, stdout=json.dumps(search), stderr='')
+            listed = listing_response(joined, details)
+            if listed:
+                return listed
             if '/pulls/' in joined:
                 number = re.search(r'/pulls/(\d+)', joined).group(1)
                 return mock.Mock(returncode=0, stdout=json.dumps(details[number]), stderr='')
@@ -515,27 +557,37 @@ class PromotionCollection(unittest.TestCase):
 
         with mock.patch.object(promotion_source.subprocess, 'run', run):
             result = promotion_source.collect(self.state)
-        self.assertTrue(result['truncated'])
-        self.assertIn(promo_url, result['unverified'])
-        self.assertIn('deferred', result['unverified'][promo_url])
-        self.assertIn('recheck', result['unverified'][promo_url].lower())
-        # The deferred candidate is visible, not just marked: it becomes a
-        # blocked row that the dashboard merge and the durable queue both see
-        # within this refresh, at a safe bottom-tier priority (never ranked
-        # above verified work while its lineage is unproven).
-        stubs = [i for i in result['items'] if i['url'] == promo_url]
-        self.assertEqual(len(stubs), 1)
-        stub = stubs[0]
+        self.assertFalse(result['truncated'])
+        self.assertEqual(result['candidates'], [])
+        self.assertEqual([i['url'] for i in result['items']], [promo_url])
+        stub = result['items'][0]
         self.assertEqual(stub['priority'], 'Promotion (unverified)')
         self.assertTrue(stub['unverified'])
         self.assertEqual(stub['next_owner'], 'bhalecb')
-        self.assertIn('deferred', stub['blocked'][0])
-        self.assertIn('refresh', stub['recheck_condition'].lower())
+        self.assertIn('encoded-custom-head', stub['branch_evidence']['head_kinds'])
+        self.assertIn('lineage unverified', stub['blocked'][-1])
+        self.assertIn(promo_url, result['unverified'])
+        # One paginated listing (three pages of the 201 PRs) plus one merge-state
+        # call for the promotion only; ordinary PRs never get a per-PR call.
+        self.assertEqual(sum(1 for c in calls if re.search(r'/pulls\s', c)), 3)
+        self.assertEqual([c for c in calls if '/pulls/' in c],
+                         [c for c in calls if '/pulls/201' in c])
+        self.assertEqual(len([c for c in calls if '/pulls/201' in c]), 1)
         merged = priority_schedule.merged_snapshot(self.state)
         rows = {i['url']: i for i in merged['items']}
-        self.assertIn(promo_url, rows)
         self.assertEqual(rows[promo_url]['priority'], 'Promotion (unverified)')
         self.assertEqual(priority_schedule.rank_map(self.state)[promo_url], 5)
+
+        # A warm refresh with unchanged PRs reuses the cached classification and
+        # lists no repository again.
+        data = json.loads((self.state / 'promotion-snapshot.json').read_text())
+        data['captured_at'] = '2020-01-01T00:00:00+00:00'
+        (self.state / 'promotion-snapshot.json').write_text(json.dumps(data))
+        calls.clear()
+        with mock.patch.object(promotion_source.subprocess, 'run', run):
+            again = promotion_source.collect(self.state)
+        self.assertEqual(sum(1 for c in calls if re.search(r'/pulls\s', c)), 0)
+        self.assertEqual([i['url'] for i in again['items']], [promo_url])
 
     def test_collect_returns_inside_the_deadline_with_a_slow_detail_call(self):
         """A detail call still in flight at the sweep deadline never stretches the
@@ -553,6 +605,9 @@ class PromotionCollection(unittest.TestCase):
             joined = ' '.join(command)
             if 'search/issues' in joined:
                 return mock.Mock(returncode=0, stdout=json.dumps(search), stderr='')
+            listed = listing_response(joined, {'99': dict(promotion_node(), url=url)})
+            if listed:
+                return listed
             if '/pulls/' in joined:
                 gate.wait(2.0)
                 return mock.Mock(returncode=0,
@@ -581,6 +636,103 @@ class PromotionCollection(unittest.TestCase):
         self.assertEqual(len(stubs), 1)
         self.assertEqual(stubs[0]['priority'], 'Promotion (unverified)')
         self.assertTrue(result['truncated'])
+
+    def test_older_source_branch_tag_in_pr_head_history_is_never_lineage(self):
+        """An older release tag sits on the source branch and in this PR head's
+        history (the head was cut from that branch later). Ancestry is not proof
+        the release is this promotion, so the PR stays an unverified blocked row."""
+        url = promotion_node()['url']
+        search = {'total_count': 1, 'incomplete_results': False, 'items': [
+            {'number': 99, 'html_url': url, 'title': 'promote release',
+             'repository_url': 'https://api.github.com/repos/commercebuildteam/client-site',
+             'updated_at': '2026-10-15T10:00:00Z', 'user': {'login': 'commercebuild'},
+             'draft': False}]}
+        details = {'99': dict(promotion_node(), url=url,
+                              body='Prepared from /releases/tag/v1.0.0.')}
+
+        def run(command, **kwargs):
+            joined = ' '.join(command)
+            if 'search/issues' in joined:
+                return mock.Mock(returncode=0, stdout=json.dumps(search), stderr='')
+            listed = listing_response(joined, details)
+            if listed:
+                return listed
+            if '/pulls/' in joined:
+                return mock.Mock(returncode=0, stdout=json.dumps(details['99']), stderr='')
+            if '/actions/runs' in joined:
+                return mock.Mock(returncode=0, stdout='[]', stderr='')
+            if '/releases/tags/' in joined:
+                return mock.Mock(returncode=0, stdout='"v1.0.0"', stderr='')
+            if '/compare/' in joined:
+                # The old tag is an ancestor of both the source branch and the head.
+                return mock.Mock(returncode=0, stdout='"ahead"', stderr='')
+            raise AssertionError('unexpected gh call: %r' % (command[:6],))
+
+        with mock.patch.object(promotion_source.subprocess, 'run', run):
+            result = promotion_source.collect(self.state)
+            direct = promotion_source.release_evidence(
+                'commercebuildteam/client-site', details['99']['body'], 'release', 'a' * 40)
+        self.assertIsNone(direct)
+        self.assertEqual([i for i in result['items'] if not i.get('unverified')], [])
+        self.assertIn(url, result['unverified'])
+
+    def test_every_call_is_bounded_by_the_refresh_deadline(self):
+        """Search, listing, merge state, and lineage all take their timeout from the
+        time left before the refresh deadline, and a lineage call still in flight at
+        the deadline is not awaited: collect() returns on time and the promotion
+        stays a visible deferred row."""
+        url = promotion_node()['url']
+        gate = threading.Event()
+        timeouts = []
+        search = {'total_count': 1, 'incomplete_results': False, 'items': [
+            {'number': 99, 'html_url': url, 'title': 'Promotion: release 3.4',
+             'repository_url': 'https://api.github.com/repos/commercebuildteam/client-site',
+             'updated_at': '2026-10-15T10:00:00Z', 'user': {'login': 'commercebuild'},
+             'draft': False}]}
+        details = {'99': dict(promotion_node(), url=url)}
+
+        def run(command, **kwargs):
+            timeouts.append(kwargs.get('timeout'))
+            joined = ' '.join(command)
+            if 'search/issues' in joined:
+                return mock.Mock(returncode=0, stdout=json.dumps(search), stderr='')
+            listed = listing_response(joined, details)
+            if listed:
+                return listed
+            if '/pulls/' in joined:
+                return mock.Mock(returncode=0, stdout=json.dumps(details['99']), stderr='')
+            if '/actions/runs' in joined:
+                gate.wait(2.0)  # a slow lineage call outlives the deadline
+                return mock.Mock(returncode=0, stdout='[]', stderr='')
+            if '/compare/' in joined:
+                return mock.Mock(returncode=0, stdout='"diverged"', stderr='')
+            if '/releases/tags/' in joined:
+                return mock.Mock(returncode=1, stdout='', stderr='Not Found')
+            raise AssertionError('unexpected gh call: %r' % (command[:6],))
+
+        with mock.patch.object(promotion_source.subprocess, 'run', run), \
+             mock.patch.object(promotion_source, 'DISCOVERY_SECONDS', 0.3):
+            began = time.monotonic()
+            result = promotion_source.collect(self.state)
+            elapsed = time.monotonic() - began
+            gate.set()
+            time.sleep(0.2)
+        self.assertLess(elapsed, 1.0)
+        self.assertTrue(timeouts)
+        self.assertTrue(all(t is not None and 0 < t <= 0.3 for t in timeouts), timeouts)
+        stubs = [i for i in result['items'] if i['url'] == url]
+        self.assertEqual(len(stubs), 1)
+        self.assertEqual(stubs[0]['priority'], 'Promotion (unverified)')
+        self.assertIn('deferred', result['unverified'][url])
+        self.assertTrue(result['truncated'])
+
+    def test_no_call_starts_after_the_deadline(self):
+        """Once the deadline has passed, a GitHub call is refused instead of
+        starting with a fresh 25-second timeout."""
+        with self.assertRaises(subprocess.TimeoutExpired):
+            promotion_source.call_timeout(time.monotonic() - 0.01)
+        self.assertEqual(promotion_source.call_timeout(None), promotion_source.CALL_TIMEOUT)
+        self.assertLessEqual(promotion_source.call_timeout(time.monotonic() + 5), 5)
 
     def test_short_source_sha_in_body_is_never_lineage(self):
         """A short hex token in the body is not a source SHA: without a verifiable
@@ -613,34 +765,58 @@ class PromotionCollection(unittest.TestCase):
         self.assertEqual(result['items'], [])
         self.assertFalse(result['errors'])
 
-    def test_budget_rotation_keeps_unverified_open_promotions_visible(self):
-        """A still-open promotion beyond this refresh's detail budget keeps its prior
-        evidence until the rotation reaches it; the cursor advances."""
+    def test_listing_failure_keeps_verified_promotion_and_defers_unknown_prs(self):
+        """When a repository cannot be listed, a previously verified open promotion
+        keeps its evidence, and an unknown PR there is a visible discovery-deferred
+        candidate. The candidate is never labelled a promotion, given a priority,
+        or queued; the error is recorded and the next refresh lists it again."""
         url_a = promotion_node()['url']
+        url_c = 'https://github.com/commercebuildteam/client-site/pull/120'
         url_b = 'https://github.com/commercebuildteam/other/pull/55'
-        search = {'total_count': 2, 'incomplete_results': False, 'items': [
+        search = {'total_count': 3, 'incomplete_results': False, 'items': [
             {'number': 99, 'html_url': url_a, 'title': 'Promotion: release 3.4',
              'repository_url': 'https://api.github.com/repos/commercebuildteam/client-site',
              'updated_at': '2026-10-15T10:00:00Z', 'user': {'login': 'commercebuild'}, 'draft': False},
+            {'number': 120, 'html_url': url_c, 'title': 'New work',
+             'repository_url': 'https://api.github.com/repos/commercebuildteam/client-site',
+             'updated_at': '2026-10-15T10:30:00Z', 'user': {'login': 'bhalecb'}, 'draft': False},
             {'number': 55, 'html_url': url_b, 'title': 'Update deps',
              'repository_url': 'https://api.github.com/repos/commercebuildteam/other',
              'updated_at': '2026-10-15T09:00:00Z', 'user': {'login': 'bhalecb'}, 'draft': False}]}
-        details = {'99': dict(promotion_node(), url=url_a)}
+        details = {'55': {'url': url_b, 'base': 'main', 'head': 'deps', 'sha': 'c' * 40,
+                          'head_repo': 'commercebuildteam/other', 'draft': False,
+                          'author': 'bhalecb', 'body': '', 'title': 'Update deps'}}
         (self.state / 'promotion-snapshot.json').write_text(json.dumps(
             {'captured_at': '2020-01-01T00:00:00+00:00',
-             'items': [{'url': url_a, 'priority': 'Promotion',
-                        'lineage': {'kind': 'promotion-workflow', 'verified': True}},
-                       {'url': url_b, 'priority': 'Promotion',
-                        'lineage': {'kind': 'promotion-workflow', 'verified': True}}],
+             'items': [{'url': url_a, 'priority': 'Promotion', 'next_owner': 'bhalecb',
+                        'lineage': {'kind': 'promotion-workflow-run', 'verified': True}}],
              'errors': [], 'last_success_at': '2026-10-15T08:00:00Z'}))
-        with mock.patch.object(promotion_source.subprocess, 'run', self.fake_gh(
-                {**search, 'details': details, 'workflow_run': True})), \
-             mock.patch.object(promotion_source, 'MAX_DETAIL_PER_REFRESH', 1):
+
+        def run(command, **kwargs):
+            joined = ' '.join(command)
+            if 'search/issues' in joined:
+                return mock.Mock(returncode=0, stdout=json.dumps(search), stderr='')
+            if 'client-site/pulls ' in joined:
+                raise subprocess.CalledProcessError(1, command, stderr='HTTP 403')
+            listed = listing_response(joined, details)
+            if listed:
+                return listed
+            raise AssertionError('unexpected gh call: %r' % (command[:6],))
+
+        with mock.patch.object(promotion_source.subprocess, 'run', run):
             result = promotion_source.collect(self.state)
-        urls = {i['url'] for i in result['items']}
-        self.assertEqual(urls, {url_a, url_b})
+        self.assertEqual([i['url'] for i in result['items']], [url_a])
+        self.assertEqual([c['url'] for c in result['candidates']], [url_c])
+        candidate = result['candidates'][0]
+        self.assertEqual(candidate['kind'], 'promotion-candidate')
+        self.assertFalse(candidate['priority'])
+        self.assertNotIn('next_owner', candidate)
+        self.assertIn('next refresh', candidate['recheck_condition'])
+        self.assertIn(url_c, result['unverified'])
+        self.assertNotIn(url_b, result['unverified'])
         self.assertTrue(result['truncated'])
-        self.assertEqual(result['cursor'], 1)
+        self.assertTrue(any('client-site' in e and 'listing failed' in e
+                            for e in result['errors']))
 
     def test_merge_supersets_ticket_items(self):
         data = {'captured_at': '2020-01-01T00:00:00+00:00',
@@ -862,7 +1038,7 @@ class Freshness(unittest.TestCase):
         (self.state / 'promotion-snapshot.json').write_text(json.dumps(stale))
         calls = []
         with mock.patch.object(promotion_source, 'search_open_prs',
-                               lambda: calls.append(1) or []), \
+                               lambda *a: calls.append(1) or []), \
              mock.patch.object(promotion_source.datetime, 'datetime',
                                self.fake_time_module(61)):
             promotion_source.collect(self.state)
@@ -1063,15 +1239,13 @@ class ReviewerRoutingAndCapacity(unittest.TestCase):
         recorder.assert_called_once_with('session-x')
 
     def test_freshness_loop_refreshes_during_a_long_round(self):
-        """The independent poller refreshes promotions and priorities while a
+        """The independent poller refreshes priorities and review intake while a
         dispatch round runs long; freshness evidence is recorded each cycle."""
         module = self._module()
         calls = []
         stop = threading.Event()
         with mock.patch.object(module.priority_schedule, 'refresh',
                                lambda *a, **k: calls.append('priority')), \
-             mock.patch.object(module.promotion_source, 'collect',
-                               lambda *a: calls.append('promotions')), \
              mock.patch.object(module.review_intake, 'refresh',
                                lambda *a: calls.append('review_intake')), \
              mock.patch.object(module, 'record_high_tier',
@@ -1082,13 +1256,88 @@ class ReviewerRoutingAndCapacity(unittest.TestCase):
             time.sleep(0.7)  # simulate a long-running dispatch round
             stop.set()
             thread.join(timeout=2)
-        self.assertGreaterEqual(calls.count('promotions'), 2)
         self.assertGreaterEqual(calls.count('priority'), 2)
         # The poller inserts newly discovered requests into the durable queue too,
         # so a request arriving during a long full pool does not wait for a slot.
         self.assertGreaterEqual(calls.count('queue_intake'), 2)
         status = json.loads((self.state / 'freshness-status.json').read_text())
         self.assertTrue(status['ok'])
+
+    def test_promotion_intake_never_waits_on_a_slow_priority_refresh(self):
+        """Promotion discovery and queue insertion run on their own loop: a ticket
+        priority refresh stuck for seconds never delays them, and each promotion
+        cycle queues right after discovery."""
+        module = self._module()
+        calls = []
+        stop = threading.Event()
+        with mock.patch.object(module.priority_schedule, 'refresh',
+                               lambda *a, **k: time.sleep(1.2)), \
+             mock.patch.object(module.review_intake, 'refresh', lambda *a: None), \
+             mock.patch.object(module.promotion_source, 'collect',
+                               lambda *a: calls.append('promotions')), \
+             mock.patch.object(module, 'record_high_tier',
+                               lambda *a: calls.append('queue_intake') or []):
+            slow = threading.Thread(target=module.freshness_loop, args=(stop, 0.1),
+                                    daemon=True)
+            fast = threading.Thread(target=module.promotion_intake_loop, args=(stop, 0.2),
+                                    daemon=True)
+            slow.start()
+            fast.start()
+            time.sleep(0.75)
+            stop.set()
+            fast.join(timeout=2)
+            # Join the slow loop while every task is still mocked.
+            slow.join(timeout=3)
+            self.assertFalse(slow.is_alive())
+        self.assertGreaterEqual(calls.count('promotions'), 2)
+        # Each promotion cycle is discovery immediately followed by queue insertion.
+        self.assertEqual(calls[:4], ['promotions', 'queue_intake'] * 2)
+        status = json.loads((self.state / 'promotion-intake-status.json').read_text())
+        self.assertTrue(status['ok'])
+        self.assertEqual(set(status['seconds']), {'promotions', 'queue_intake'})
+
+    def test_unclassified_candidates_are_visible_but_never_queued_or_reranked(self):
+        """A discovery-deferred candidate and an unverified-lineage stub never lower
+        an existing row's priority, and a candidate is never queued or routed as a
+        review; the dashboard still shows it when nothing else covers the URL."""
+        module = self._module()
+        module.QUEUE_PATH = self.state / 'dispatch' / 'queue.json'
+        (self.state / 'dispatch').mkdir(parents=True, exist_ok=True)
+        module.archived_repos = lambda: set()
+        lone = 'https://github.com/commercebuildteam/r3/pull/7'
+        stub_url = 'https://github.com/commercebuildteam/r4/pull/8'
+        (self.state / 'review-intake.json').write_text(json.dumps({'items': [
+            {'url': DONAVON_PR, 'title': 'Fix thing', 'donavon_request': True,
+             'priority': 'High', 'updated_at': '2026-10-15T11:00:00Z'},
+            {'url': stub_url, 'title': 'Promotion', 'donavon_request': True,
+             'priority': 'High', 'updated_at': '2026-10-15T11:00:00Z'}]}))
+        candidate = {'kind': 'promotion-candidate', 'priority': '', 'unverified': True,
+                     'blocked': ['classification deferred'],
+                     'recheck_condition': 'next refresh lists the repository again'}
+        (self.state / 'promotion-snapshot.json').write_text(json.dumps({
+            'captured_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            'items': [{'url': stub_url, 'title': 'Promotion', 'kind': 'promotion',
+                       'priority': 'Promotion (unverified)', 'unverified': True,
+                       'next_owner': 'bhalecb', 'blocked': ['lineage unverified'],
+                       'updatedAt': '2026-10-15T10:00:00Z'}],
+            'candidates': [dict(candidate, url=DONAVON_PR, title='Fix thing'),
+                           dict(candidate, url=lone, title='Unknown PR')]}))
+        rows = {i['url']: i for i in priority_schedule.merged_snapshot(self.state)['items']}
+        self.assertEqual(rows[DONAVON_PR]['priority'], 'High')
+        self.assertEqual(rows[stub_url]['priority'], 'High')
+        self.assertEqual(rows[lone]['kind'], 'promotion-candidate')
+        ranks = priority_schedule.rank_map(self.state)
+        self.assertEqual(ranks[DONAVON_PR], priority_schedule.RANK['High'])
+        self.assertEqual(ranks[stub_url], priority_schedule.RANK['High'])
+        self.assertNotIn(lone, module.review_entry_urls(self.state))
+        self.assertNotIn(lone, {r['url'] for r in module.high_tier_rows(self.state, set())})
+        recorded = module.record_high_tier('session-x')
+        self.assertNotIn(lone, {r['url'] for r in recorded})
+        self.assertNotIn(lone, {e['issue'] for e in module.read_queue()})
+        import priority_dashboard
+        html = priority_dashboard.render(priority_schedule.merged_snapshot(self.state),
+                                         [], set(), {}, {}, False)
+        self.assertIn('Promotion discovery deferred', html)
 
     def test_all_qualifying_requests_in_one_repo_stay_pending(self):
         """Three Donavon-requested PRs in one repository all enter the durable
@@ -1228,6 +1477,12 @@ class ReviewerRoutingAndCapacity(unittest.TestCase):
                                            + 'a' * 7 + 'b' * 33)):
             status, _ = module.settle_status(entry, DONAVON_PR, started)
         self.assertEqual(status, 'incomplete')
+        # The head embedded inside a longer hex string is not the head SHA.
+        with mock.patch.object(module.subprocess, 'run',
+                               comment_run('Review result: findings posted for head '
+                                           + head + 'ff')):
+            status, _ = module.settle_status(entry, DONAVON_PR, started)
+        self.assertEqual(status, 'incomplete')
         # Head-bound marker posted before the run started proves nothing.
         before = 'Review result: findings posted for head ' + head
         with mock.patch.object(module.subprocess, 'run', comment_run(before, at='2026-10-15T11:00:00Z')):
@@ -1262,6 +1517,7 @@ class ReviewerRoutingAndCapacity(unittest.TestCase):
 
         with mock.patch.object(module.subprocess, 'run', fake_run), \
              mock.patch.object(module.priority_schedule, 'refresh', lambda *a, **k: None), \
+             mock.patch.object(module.promotion_source, 'collect', lambda *a, **k: {}), \
              mock.patch.object(module.priority_schedule, 'order', lambda rows, state=None: rows), \
              mock.patch.object(module, 'pr_owner_sweep', lambda *a, **k: {'prs': {}}), \
              mock.patch.object(module, 'linked_issue_number', lambda item: None), \

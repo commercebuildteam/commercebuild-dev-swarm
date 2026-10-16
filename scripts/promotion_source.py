@@ -11,26 +11,28 @@ import json
 import pathlib
 import re
 import subprocess
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, wait
 
 RANK = {'Promotion': 0}
 REFRESH_SECONDS = 60
 MAX_SEARCH_PAGES = 10
-# Each refresh verifies this many candidates, in parallel; the rotation reaches the
-# rest of the open-PR list on later refreshes, and unexamined candidates stay
-# marked in the snapshot so an unknown promotion can never silently lose priority.
-MAX_DETAIL_PER_REFRESH = 200
+# Classification lists each repository's open PRs (one paginated call per repository
+# with open PRs, branch refs included) instead of fetching every PR, so every open PR
+# is classified in one refresh with no per-PR budget. A PR whose search updatedAt is
+# unchanged reuses its cached classification, so a warm refresh lists only changed
+# repositories. Merge-state detail and lineage run only for classified promotions.
+MAX_LIST_PAGES = 10
 DETAIL_WORKERS = 8
-# Classification is cheap and covers every budgeted candidate; the expensive
-# lineage compares run inside this separate budget with rotation, so a long
-# promotion list never blocks the refresh window. Cached evidence for an
+# Lineage compares run inside this budget with rotation; cached evidence for an
 # unchanged head applies instantly on later refreshes.
 MAX_LINEAGE_PER_REFRESH = 40
-# Bounded refresh deadline; past it, remaining candidates are deferred. The
-# deadline starts before the search, so the whole refresh (search plus sweep)
-# finishes inside the 60-second intake window with margin for the cadence.
-DISCOVERY_SECONDS = 45
+# Hard bound for the whole refresh, search included. Every GitHub call takes its
+# timeout from the time left before this deadline, and in-flight calls are never
+# awaited past it, so discovery plus queue insertion fits the 60-second window.
+DISCOVERY_SECONDS = 40
+CALL_TIMEOUT = 25
 
 # A promotion PR targets a release or stable branch. Both channels take precedence.
 PROMO_TARGET = re.compile(r'^(release(?:/.+)?|stable(?:/.+)?)$', re.IGNORECASE)
@@ -47,10 +49,6 @@ REPLACEMENT = re.compile(r'replacement', re.IGNORECASE)
 SOURCE_RECORD = re.compile(r'(?i)source[:\s`]+([0-9a-f]{40})\b')
 RELEASE_REF = re.compile(r'(?i)/releases/tag/([\w.\-]+)')
 WORKFLOW_PATH = '.github/workflows/promotion-prepare.yml'
-# Title words only prioritize which candidates are verified first within the
-# per-refresh budget; branch structure verification alone classifies, and the
-# rotation reaches every open PR.
-PROMO_TITLE = re.compile(r'\bpromot\w*\b|\brelease\s+v?\d+|\bmaster-to-release\b', re.IGNORECASE)
 BOT_LOGINS = {'commercebuild', 'github-actions', 'commercebuild-bot'}
 
 
@@ -63,13 +61,28 @@ def is_bot(author):
     return login.lower() in BOT_LOGINS or login.endswith('[bot]')
 
 
-def gh(*args, timeout=25):
+def call_timeout(deadline=None):
+    """Timeout for one GitHub call: never past the refresh deadline."""
+    if deadline is None:
+        return CALL_TIMEOUT
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise subprocess.TimeoutExpired('gh', 0)
+    return min(CALL_TIMEOUT, left)
+
+
+def run_gh(command, deadline=None):
+    return subprocess.run(command, capture_output=True, text=True,
+                          timeout=call_timeout(deadline))
+
+
+def gh(*args, deadline=None):
     result = subprocess.run(['gh', *args], check=True, capture_output=True,
-                            text=True, timeout=timeout)
+                            text=True, timeout=call_timeout(deadline))
     return json.loads(result.stdout)
 
 
-def search_open_prs():
+def search_open_prs(deadline=None):
     """Bounded, paginated open-PR search across all non-archived org repositories."""
     rows, cursor = [], None
     for _ in range(MAX_SEARCH_PAGES):
@@ -79,7 +92,7 @@ def search_open_prs():
                    '-f', 'sort=updated', '-f', 'order=desc', '-f', 'per_page=100']
         if cursor:
             command += ['-f', f'page={cursor}']
-        data = gh(*command)
+        data = gh(*command, deadline=deadline)
         if data.get('incomplete_results'):
             raise RuntimeError('GitHub promotion search returned incomplete results')
         rows.extend(data['items'])
@@ -96,14 +109,31 @@ def search_open_prs():
     return result
 
 
-def pr_detail(repo, number):
+def pr_detail(repo, number, deadline=None):
     """Branch source/target, draft, author, and merge state for one PR."""
     data = gh('api', f'repos/{repo}/pulls/{number}', '--jq',
               '{head: .head.ref, base: .base.ref, sha: .head.sha, '
               'head_repo: .head.repo.full_name, draft: .draft, state: .state, '
               'author: .user.login, mergeable: .mergeable_state, title: .title, '
-              'body: (.body // "")}')
+              'body: (.body // "")}', deadline=deadline)
     return data
+
+
+def list_open_prs(repo, deadline=None):
+    """Every open PR in one repository with its branch refs, so classification
+    covers the whole repository in one paginated call instead of one call per PR.
+    The list endpoint has no merge state; that is fetched for promotions only."""
+    rows = []
+    for page in range(1, MAX_LIST_PAGES + 1):
+        data = gh('api', '--method', 'GET', f'repos/{repo}/pulls', '-f', 'state=open',
+                  '-f', 'per_page=100', '-f', f'page={page}', '--jq',
+                  '[.[] | {number, url: .html_url, head: .head.ref, base: .base.ref, '
+                  'sha: .head.sha, head_repo: .head.repo.full_name, draft, state, '
+                  'author: .user.login, title, body: (.body // "")}]', deadline=deadline)
+        rows.extend(data)
+        if len(data) < 100:
+            return rows
+    raise RuntimeError(f'{repo}: more than {MAX_LIST_PAGES * 100} open PRs')
 
 
 def branch_evidence(detail):
@@ -133,7 +163,7 @@ def branch_evidence(detail):
             'head_repo': head_repo, 'verified': verified}
 
 
-def promotion_workflow_run(repo, head_sha, cache):
+def promotion_workflow_run(repo, head_sha, cache, deadline=None):
     """A promotion-prepare workflow run for this exact PR head ties the PR to a
     machine-prepared source snapshot. The workflow file merely existing in the
     repository proves nothing about this PR, so lineage requires a run whose
@@ -142,11 +172,11 @@ def promotion_workflow_run(repo, head_sha, cache):
     if key in cache:
         return cache[key]
     verified = None
-    result = subprocess.run(
+    result = run_gh(
         ['gh', 'api', '--method', 'GET', 'repos/' + repo + '/actions/runs',
          '-f', 'per_page=20', '--jq',
          '[.workflow_runs[] | select(.path == "' + WORKFLOW_PATH + '") | {id, head_sha, head_branch}]'],
-        capture_output=True, text=True, timeout=25)
+        deadline)
     if result.returncode == 0:
         try:
             runs = json.loads(result.stdout or '[]')
@@ -174,59 +204,69 @@ def source_branches_for(base):
     return ['master', 'main']
 
 
-def source_branch_ancestor(repo, ref, branch):
+def compare_status(repo, base_ref, head_ref, deadline=None):
+    result = run_gh(
+        ['gh', 'api', f'repos/{repo}/compare/{base_ref}...{head_ref}', '--jq', '.status'],
+        deadline)
+    if result.returncode:
+        return ''
+    return (result.stdout or '').strip().strip('"')
+
+
+def source_branch_ancestor(repo, ref, branch, deadline=None):
     """The ref (a recorded source SHA or a release tag) is on the source branch:
     identical to its head or an ancestor of it (the branch may have moved after
     the promotion was prepared)."""
-    result = subprocess.run(
-        ['gh', 'api', f'repos/{repo}/compare/{ref}...{branch}', '--jq', '.status'],
-        capture_output=True, text=True, timeout=25)
-    if result.returncode:
-        return False
-    return (result.stdout or '').strip().strip('"') in ('identical', 'ahead')
+    return compare_status(repo, ref, branch, deadline) in ('identical', 'ahead')
 
 
-def release_evidence(repo, body, base='', head_sha=''):
+def release_evidence(repo, body, base='', head_sha='', deadline=None):
     """A linked GitHub release in the PR body verifies only when the tag exists,
-    its commit belongs to this candidate's source branch, and that commit is
-    contained in this PR's head (identical to it or an ancestor of it): an
-    existing release link, or a tag merely sitting on the source branch, proves
-    nothing about the promotion whose body links it."""
+    its commit is on this candidate's source branch, and its commit is exactly this
+    PR's head commit. An older tag is an ancestor of any head cut from the source
+    branch, so ancestry alone would let an unrelated existing release lend its
+    lineage to a different promotion; only an identical commit ties the release to
+    this PR."""
     match = RELEASE_REF.search(body or '')
-    if not match or not re.fullmatch(r'[0-9a-f]{40}', (head_sha or '').strip()):
+    head_sha = (head_sha or '').strip()
+    if not match or not re.fullmatch(r'[0-9a-f]{40}', head_sha):
         return None
     tag = match.group(1)
-    result = subprocess.run(['gh', 'api', 'repos/' + repo + '/releases/tags/' + tag,
-                             '--jq', '.tag_name'], capture_output=True, text=True, timeout=25)
+    result = run_gh(['gh', 'api', 'repos/' + repo + '/releases/tags/' + tag,
+                     '--jq', '.tag_name'], deadline)
     if result.returncode:
         return None
+    if compare_status(repo, tag, head_sha, deadline) != 'identical':
+        return None
     for branch in source_branches_for(base):
-        if source_branch_ancestor(repo, tag, branch) \
-                and source_branch_ancestor(repo, tag, head_sha.strip()):
+        if source_branch_ancestor(repo, tag, branch, deadline):
             return {'kind': 'linked-release', 'tag': tag, 'source_branch': branch,
-                    'verified': True}
+                    'head_sha': head_sha, 'verified': True}
     return None
 
 
-def lineage_evidence(repo, detail, cache):
+def lineage_evidence(repo, detail, cache, deadline=None):
     """Verified promotion lineage beyond naming and a head commit.
 
     Three PR-specific proofs, in order of strength: a promotion-prepare workflow
     run for this PR's head commit; a recorded source SHA verifiably on the
-    direction's source branch; or a linked release whose tag commit belongs to
-    that branch. Anything less is an unverified candidate and is never ranked.
+    direction's source branch; or a linked release whose tag commit is this PR's
+    head and is on that branch. Anything less is an unverified candidate and is
+    never ranked.
     """
     head_sha = (detail.get('sha') or '').strip()
-    if head_sha and promotion_workflow_run(repo, head_sha, cache):
-        return promotion_workflow_run(repo, head_sha, cache)
+    if head_sha:
+        run = promotion_workflow_run(repo, head_sha, cache, deadline)
+        if run:
+            return run
     base = (detail.get('base') or '').strip()
     record = SOURCE_RECORD.search(detail.get('body') or '')
     if record and re.fullmatch(r'[0-9a-f]{40}', record.group(1)):
         for branch in source_branches_for(base):
-            if source_branch_ancestor(repo, record.group(1), branch):
+            if source_branch_ancestor(repo, record.group(1), branch, deadline):
                 return {'kind': 'source-record', 'source_sha': record.group(1),
                         'source_branch': branch, 'verified': True}
-    return release_evidence(repo, detail.get('body') or '', base, head_sha)
+    return release_evidence(repo, detail.get('body') or '', base, head_sha, deadline)
 
 
 def classify(detail):
@@ -274,9 +314,47 @@ def snapshot(state):
         return {}
 
 
+_collect_lock = threading.Lock()
+
+
+def gather(fn, jobs, deadline):
+    """Run fn(*job) in parallel and return ({key: result}, {key: error}, {unfinished keys}).
+
+    Nothing is awaited past the deadline: unfinished calls are cancelled or left to
+    expire on their own deadline-clamped timeouts, so the refresh returns on time.
+    """
+    done_results, errors, unfinished = {}, {}, set(jobs)
+    if not jobs:
+        return done_results, errors, unfinished
+    pool = ThreadPoolExecutor(max_workers=DETAIL_WORKERS)
+    futures = {}
+    try:
+        futures = {pool.submit(fn, *args): key for key, args in jobs.items()}
+        pending = set(futures)
+        while pending:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            done, pending = wait(pending, timeout=min(1, left))
+            for future in done:
+                key = futures[future]
+                unfinished.discard(key)
+                try:
+                    done_results[key] = future.result()
+                except (subprocess.SubprocessError, RuntimeError, ValueError,
+                        OSError, KeyError, TypeError) as exc:
+                    errors[key] = type(exc).__name__
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    return done_results, errors, unfinished
+
+
 def collect(state):
     """Refresh the promotion snapshot with a 60-second cache; on failure keep the
-    previous items and record the error so freshness is never silently lost."""
+    previous items and record the error so freshness is never silently lost.
+
+    One refresh at a time: a concurrent caller gets the current snapshot instead of
+    starting a second discovery pass against the same quota."""
     path = pathlib.Path(state) / 'promotion-snapshot.json'
     now = datetime.datetime.now(datetime.timezone.utc)
     old = snapshot(state)
@@ -286,171 +364,174 @@ def collect(state):
             return old
     except (KeyError, ValueError, TypeError):
         pass
-    result = {'captured_at': now.isoformat(), 'interval_seconds': REFRESH_SECONDS,
-              'items': [], 'errors': [], 'truncated': False,
-              'unverified': {}}
+    if not _collect_lock.acquire(blocking=False):
+        return old
     try:
-        # The deadline starts before the search: the whole refresh (search plus
-        # sweep) must finish inside the 60-second intake window, so neither a
-        # long search nor an in-flight detail call may stretch it past the
-        # cadence. Past the deadline, verifications are cancelled without
-        # waiting; their candidates stay marked unverified so they are never
-        # silently unprioritized.
-        deadline = time.monotonic() + DISCOVERY_SECONDS
-        rows = search_open_prs()
+        return _collect(path, now, old)
+    finally:
+        _collect_lock.release()
+
+
+def _collect(path, now, old):
+    result = {'captured_at': now.isoformat(), 'interval_seconds': REFRESH_SECONDS,
+              'items': [], 'candidates': [], 'errors': [], 'truncated': False,
+              'unverified': {}}
+    # The deadline starts before the search and bounds every call in this refresh,
+    # so search, listing, merge-state detail, and lineage together finish inside it.
+    deadline = time.monotonic() + DISCOVERY_SECONDS
+    try:
+        rows = search_open_prs(deadline)
         open_urls = {row['url'] for row in rows}
-        # Rotation: each refresh verifies the next slice of the open-PR list so a
-        # large organization is covered over consecutive refreshes. Likely
-        # promotions (by title) are verified first for fresh discovery.
-        start = int(old.get('cursor') or 0) % len(rows) if rows else 0
-        ordered = rows[start:] + rows[:start]
-        likely = {r['url'] for r in ordered if PROMO_TITLE.search(r['title'] or '')}
-        queue = [r for r in ordered if r['url'] in likely] + \
-                [r for r in ordered if r['url'] not in likely]
-        fresh, examined = [], set()
+        old_items = {i['url']: i for i in old.get('items') or [] if i.get('url')}
         lineage_cache = {}
         for key, value in (old.get('lineage_cache') or {}).items():
             repo_key, _, sha_key = str(key).partition('|')
             if repo_key and sha_key and isinstance(value, dict):
                 lineage_cache[(repo_key, sha_key)] = value
-        submitted = queue[:MAX_DETAIL_PER_REFRESH]
-        deferred_rows = queue[MAX_DETAIL_PER_REFRESH:]
-        candidates_total = len(ordered)
 
-        def detail_for(row):
-            """Detail and classification for one candidate; cheap by design so
-            every open promotion is classified within this refresh."""
-            detail = pr_detail(row['repo'], row['number'])
-            detail.update({'url': row['url'], 'updatedAt': row['updatedAt'],
-                           'verified_at': now.isoformat()})
-            return row, detail, classify(detail)
-
-        results, failed, unverified, deferred = {}, {}, {}, []
-        candidates, futures, pending = [], {}, set()
-
-        pool = ThreadPoolExecutor(max_workers=DETAIL_WORKERS)
-        try:
-            futures = {pool.submit(detail_for, row): row for row in submitted}
-            pending = set(futures)
-            while pending and time.monotonic() < deadline:
-                done, pending = wait(pending, timeout=min(1, max(0, deadline - time.monotonic())))
-                for future in done:
-                    row = futures[future]
-                    examined.add(row['url'])
-                    try:
-                        _, detail, item = future.result()
-                    except (subprocess.SubprocessError, ValueError, OSError, KeyError) as exc:
-                        failed[row['url']] = f'{row["url"]}: {type(exc).__name__}'
-                        continue
-                    if item:
-                        candidates.append((row, detail, item))
-        finally:
-            for future in pending:
-                future.cancel()
-            # Do not wait for in-flight detail calls: they hold only local state,
-            # and the refresh must return inside the intake window.
-            pool.shutdown(wait=False, cancel_futures=True)
-        for row in futures.values():
-            if row['url'] not in examined:
-                reason = 'detail verification deferred to a later refresh'
-                unverified[row['url']] = reason
-                deferred.append((row, None, reason))
-        # Beyond-budget candidates are deferred, not dropped: each stays
-        # individually visible with its recheck condition, so a promotion
-        # late in a large open-PR list can never silently lose priority.
-        for row in deferred_rows:
-            reason = ('detail verification deferred beyond this refresh\'s '
-                      'budget; recheck after the next refresh cycle')
-            unverified[row['url']] = reason
-            deferred.append((row, None, reason))
-
-        # Phase 2: lineage for classified promotions only, inside its own budget
-        # and rotation so expensive compares never block the refresh window.
-        # Cached evidence for an unchanged head applies instantly, so a warm
-        # snapshot verifies without new lineage calls.
-        candidates.sort(key=lambda entry: entry[0]['url'])
-        lineage_start = int(old.get('lineage_cursor') or 0) % len(candidates) \
-            if candidates else 0
-        candidates = candidates[lineage_start:] + candidates[:lineage_start]
-        lineage_queue, lineage_slice = [], []
-        for row, detail, item in candidates:
-            key = (row['repo'], (item['branch_evidence'].get('sha') or '').strip())
-            cached = lineage_cache.get(key)
-            if cached and cached.get('verified'):
-                item['lineage'] = cached
-                fresh = [i for i in fresh if i['url'] != item['url']]
-                fresh.append(item)
+        # Phase 1: classify every open PR. Unchanged PRs reuse their cached
+        # classification; every repository with a new or changed PR is listed once.
+        cached = old.get('classification') or {}
+        classification, need_repos = {}, set()
+        for row in rows:
+            entry = cached.get(row['url'])
+            if isinstance(entry, dict) and entry.get('updatedAt') == row['updatedAt']:
+                classification[row['url']] = entry
             else:
-                lineage_queue.append((row, detail, item, key))
-        for entry in lineage_queue[:MAX_LINEAGE_PER_REFRESH]:
-            lineage_slice.append(entry)
-        for row, _, item, _ in lineage_queue[MAX_LINEAGE_PER_REFRESH:]:
-            reason = ('lineage verification deferred beyond this refresh\'s '
-                      'budget; recheck after the next refresh cycle')
-            unverified[row['url']] = reason
+                need_repos.add(row['repo'])
+        listings, list_errors, _ = gather(
+            list_open_prs, {repo: (repo, deadline) for repo in sorted(need_repos)}, deadline)
+        for repo, listed in listings.items():
+            by_url = {pr.get('url'): pr for pr in listed}
+            for row in rows:
+                if row['repo'] != repo:
+                    continue
+                pr = by_url.get(row['url'])
+                if pr is None:
+                    continue
+                detail = dict(pr, url=row['url'], updatedAt=row['updatedAt'],
+                              mergeable='unknown')
+                classification[row['url']] = {
+                    'updatedAt': row['updatedAt'],
+                    'detail': detail if classify(detail) else None}
+        for repo, error in list_errors.items():
+            result['errors'].append(f'{repo}: listing failed ({error})')
+
+        unverified, deferred, candidates = {}, [], []
+        promotions = []
+        for row in rows:
+            entry = classification.get(row['url'])
+            if entry is None:
+                # Not classified this refresh (listing failed or ran out of time).
+                # A previously verified promotion keeps its evidence; anything else
+                # is a visible discovery-deferred candidate. It is never labelled a
+                # promotion, queued, or given a priority until its branches are read.
+                if (old_items.get(row['url']) or {}).get('lineage', {}).get('verified'):
+                    result['items'].append(old_items[row['url']])
+                    continue
+                reason = ('classification deferred: this repository\'s open PRs could '
+                          'not be listed in this refresh')
+                unverified[row['url']] = reason
+                candidates.append({
+                    'url': row['url'], 'title': row['title'] or '',
+                    'kind': 'promotion-candidate', 'priority': '',
+                    'unverified': True, 'blocked': [reason],
+                    'recheck_condition': 'next refresh lists the repository again',
+                    'updatedAt': row['updatedAt'], 'verified_at': now.isoformat()})
+            elif entry.get('detail'):
+                promotions.append((row, dict(entry['detail'])))
+
+        # Phase 2: merge state and lineage for classified promotions only, in
+        # parallel and bounded by the same deadline. Lineage compares stay inside
+        # their own budget with rotation; cached evidence for an unchanged head
+        # needs no call.
+        promotions.sort(key=lambda entry: entry[0]['url'])
+        lineage_start = int(old.get('lineage_cursor') or 0) % len(promotions) \
+            if promotions else 0
+        promotions = promotions[lineage_start:] + promotions[:lineage_start]
+        lineage_jobs = 0
+
+        def verify(row, detail, run_lineage):
+            detail = dict(detail)
+            detail.update(pr_detail(row['repo'], row['number'], deadline))
+            detail.update(url=row['url'], updatedAt=row['updatedAt'],
+                          verified_at=now.isoformat())
+            item = classify(detail)
+            if not item:
+                return None, None
+            key = (row['repo'], (detail.get('sha') or '').strip())
+            lineage = lineage_cache.get(key)
+            if not (lineage and lineage.get('verified')) and run_lineage:
+                lineage = lineage_evidence(row['repo'], detail, lineage_cache, deadline)
+                if lineage and lineage.get('verified'):
+                    lineage_cache[key] = lineage
+            return item, lineage
+
+        jobs, lineage_deferred = {}, set()
+        for row, detail in promotions:
+            key = (row['repo'], (detail.get('sha') or '').strip())
+            warm = (lineage_cache.get(key) or {}).get('verified')
+            run_lineage = warm or lineage_jobs < MAX_LINEAGE_PER_REFRESH
+            if not warm and run_lineage:
+                lineage_jobs += 1
+            if not run_lineage:
+                lineage_deferred.add(row['url'])
+            jobs[row['url']] = (row, detail, run_lineage)
+        verified, verify_errors, unfinished = gather(verify, jobs, deadline)
+        for row, detail in promotions:
+            url = row['url']
+            if url in verified:
+                item, lineage = verified[url]
+                if item is None:
+                    continue
+                if lineage and lineage.get('verified'):
+                    item['lineage'] = lineage
+                    result['items'].append(item)
+                    continue
+                reason = ('lineage verification deferred beyond this refresh\'s budget; '
+                          'recheck after the next refresh cycle' if url in lineage_deferred
+                          else 'promotion lineage unverified: no promotion workflow run, '
+                               'no source branch/SHA record, and no linked release for this head')
+            else:
+                if url in verify_errors:
+                    result['errors'].append(f'{url}: {verify_errors[url]}')
+                prior = old_items.get(url) or {}
+                if prior.get('lineage', {}).get('verified') and \
+                        (prior.get('branch_evidence') or {}).get('sha') == detail.get('sha'):
+                    result['items'].append(prior)
+                    continue
+                item = classify(detail)
+                reason = 'verification deferred to the next refresh cycle'
+            unverified[url] = reason
             deferred.append((row, item, reason))
-        for row, detail, item, _ in lineage_slice:
-            if time.monotonic() >= deadline:
-                reason = 'lineage verification deferred to the next refresh cycle'
-                unverified[row['url']] = reason
-                deferred.append((row, item, reason))
-                continue
-            try:
-                lineage = lineage_evidence(row['repo'], detail, lineage_cache)
-            except (subprocess.SubprocessError, ValueError, OSError, KeyError) as exc:
-                failed[row['url']] = f'{row["url"]}: {type(exc).__name__}'
-                continue
-            if lineage and lineage.get('verified'):
-                item['lineage'] = lineage
-                fresh = [i for i in fresh if i['url'] != item['url']]
-                fresh.append(item)
-            else:
-                reason = ('promotion lineage unverified: no promotion workflow '
-                          'run, no source branch/SHA record, and no linked release')
-                unverified[row['url']] = reason
-                deferred.append((row, item, reason))
-        fresh_urls = {i['url'] for i in fresh}
-        # Rebuild from live search: a merged or closed promotion disappears instead
-        # of ranking forever. Still-open items this refresh could not verify stay
-        # visible with their previous evidence until the rotation reaches them.
-        kept = [i for i in old.get('items') or []
-                if i['url'] in open_urls and i['url'] not in fresh_urls
-                and i['url'] not in examined and i.get('lineage', {}).get('verified')]
-        result['items'] = fresh + kept
-        # Every candidate this refresh could not verify becomes a visible blocked
-        # row with a safe (bottom-tier) queue priority, so the dashboard and the
-        # durable queue both see a deferred promotion within this refresh instead
-        # of only the snapshot map. Title or branch naming never classifies here;
-        # an unclassified candidate is labelled unverified until the rotation
-        # reaches it, and a classified promotion keeps its branch evidence.
-        verified_urls = {i['url'] for i in result['items']}
+
+        # A classified promotion whose lineage is not yet proven stays a visible
+        # blocked row with a safe bottom-tier priority. It keeps its branch evidence
+        # and next owner, so it is queued for review but never ranked above work.
         for row, item, reason in deferred:
-            if row['url'] in verified_urls:
-                continue
-            if item:
-                stub = dict(item)
-                stub['blocked'] = list(item.get('blocked') or []) + [reason]
-            else:
-                stub = {'url': row['url'], 'title': row['title'] or '',
-                        'kind': 'promotion', 'next_owner': 'bhalecb',
-                        'blocked': [reason],
-                        'recheck_condition':
-                            'next refresh cycle verifies this candidate (rotation)'}
+            stub = dict(item)
+            stub['blocked'] = list(item.get('blocked') or []) + [reason]
             stub.update({'priority': 'Promotion (unverified)', 'unverified': True,
-                         'updatedAt': row['updatedAt'],
-                         'verified_at': now.isoformat()})
+                         'updatedAt': row['updatedAt'], 'verified_at': now.isoformat()})
             result['items'].append(stub)
-        result['errors'].extend(failed.values())
+        result['candidates'] = candidates
         result['unverified'].update(unverified)
-        result['truncated'] = len(examined) < candidates_total
-        result['cursor'] = (start + len(examined)) % len(rows) if rows else 0
-        result['lineage_cursor'] = (lineage_start + len(lineage_slice)) % len(candidates) \
-            if candidates else 0
+        result['truncated'] = bool(candidates or unfinished or lineage_deferred)
+        # The next refresh starts its lineage budget at the first deferred promotion.
+        result['lineage_cursor'] = next(
+            ((lineage_start + index) % len(promotions)
+             for index, (row, _) in enumerate(promotions) if row['url'] in lineage_deferred),
+            0)
+        result['classification'] = {url: entry for url, entry in classification.items()
+                                    if url in open_urls}
         result['lineage_cache'] = {f'{r}|{s}': v for (r, s), v in lineage_cache.items() if v}
     except (subprocess.SubprocessError, RuntimeError, ValueError, OSError) as exc:
         result['errors'].append(str(exc) if isinstance(exc, RuntimeError) else type(exc).__name__)
         # Rate limiting and permission failures keep last-known items visible.
         result['items'] = old.get('items') or []
+        result['candidates'] = old.get('candidates') or []
+        result['classification'] = old.get('classification') or {}
+        result['lineage_cache'] = old.get('lineage_cache') or {}
         result['last_success_at'] = old.get('last_success_at')
     else:
         result['last_success_at'] = now.isoformat()
@@ -461,7 +542,13 @@ def collect(state):
 
 
 def items(state):
+    """Classified promotions only: verified rows and unverified-lineage stubs."""
     return snapshot(state).get('items') or []
+
+
+def candidates(state):
+    """Open PRs this refresh could not classify; visible only, never queued."""
+    return snapshot(state).get('candidates') or []
 
 
 def merge_into(snapshot_data, state):
