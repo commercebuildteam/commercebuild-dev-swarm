@@ -100,6 +100,18 @@ class PromotionClassification(unittest.TestCase):
         item = promotion_source.classify(promotion_node(base='main', head='feature/promo-page'))
         self.assertIsNone(item)
 
+    def test_custom_head_classifies_only_on_verified_lineage(self):
+        """A custom head matching no promotion naming pattern is not discarded:
+        verified lineage classifies it, and without lineage it is not a candidate."""
+        node = promotion_node(head='automation/ship-to-release')
+        self.assertIsNone(promotion_source.classify(node))
+        lineage = {'kind': 'source-record', 'source_sha': 'b' * 40,
+                   'source_branch': 'master', 'verified': True}
+        item = promotion_source.classify(node, lineage)
+        self.assertEqual(item['priority'], 'Promotion')
+        self.assertEqual(item['branch_evidence']['head_kinds'], [])
+        self.assertTrue(item['branch_evidence']['verified'])
+
 
 class PromotionCollection(unittest.TestCase):
     def setUp(self):
@@ -152,6 +164,78 @@ class PromotionCollection(unittest.TestCase):
         self.assertEqual(len(result['items']), 1)
         self.assertEqual(result['items'][0]['priority'], 'Promotion')
         self.assertEqual(result['errors'], [])
+
+    def _custom_head_search(self, body):
+        node = dict(promotion_node(head='automation/ship-to-release'), body=body)
+        search = {'total_count': 1, 'incomplete_results': False, 'items': [
+            {'number': 99, 'html_url': node['url'], 'title': node['title'],
+             'repository_url': 'https://api.github.com/repos/commercebuildteam/client-site',
+             'updated_at': '2026-10-15T10:00:00Z', 'user': {'login': 'commercebuild'},
+             'draft': False}]}
+        return search, {'99': dict(node, url=node['url'])}
+
+    def test_custom_head_promotion_classified_through_verified_lineage(self):
+        """A release-target PR on a custom head with a verified source record is
+        classified as a promotion; naming is not the only accepted proof."""
+        search, details = self._custom_head_search(
+            'Promotion PR. source: ' + 'b' * 40)
+        with mock.patch.object(promotion_source.subprocess, 'run', self.fake_gh(
+                {**search, 'details': details, 'workflow_run': False,
+                 'source_ancestor': True})):
+            result = promotion_source.collect(self.state)
+        self.assertEqual(len(result['items']), 1)
+        item = result['items'][0]
+        self.assertEqual(item['priority'], 'Promotion')
+        self.assertEqual(item['branch_evidence']['head_kinds'], [])
+        self.assertEqual(item['lineage']['kind'], 'source-record')
+        self.assertTrue(item['lineage']['verified'])
+
+    def test_custom_head_without_lineage_is_not_a_candidate(self):
+        """A custom head with no workflow run and no verifiable source record is
+        not classified, does not queue, and leaves no unverified promotion row."""
+        search, details = self._custom_head_search(
+            'Promotion PR. source: ' + 'c' * 40)
+        with mock.patch.object(promotion_source.subprocess, 'run', self.fake_gh(
+                {**search, 'details': details, 'workflow_run': False,
+                 'source_ancestor': False})):
+            result = promotion_source.collect(self.state)
+        self.assertEqual(result['items'], [])
+        self.assertNotIn(details['99']['url'], result['unverified'])
+        self.assertEqual(result['candidates'], [])
+
+    def test_search_page_cap_keeps_last_known_items_and_records_incomplete(self):
+        """When the search stops at its page cap with open PRs left unread, the
+        refresh keeps the previous snapshot and records the incomplete search
+        instead of reporting a complete successful pass."""
+        good = {'captured_at': '2020-01-01T00:00:00+00:00', 'items': [
+            {'url': promotion_node()['url'], 'priority': 'Promotion'}],
+            'errors': [], 'last_success_at': '2026-10-15T09:00:00Z'}
+        (self.state / 'promotion-snapshot.json').write_text(json.dumps(good))
+
+        def page_items(page):
+            return [{'number': n,
+                     'html_url': 'https://github.com/commercebuildteam/r%d/pull/%d' % (n, n),
+                     'title': 'PR',
+                     'repository_url': 'https://api.github.com/repos/commercebuildteam/r%d' % n,
+                     'updated_at': '2026-10-15T10:00:00Z',
+                     'user': {'login': 'commercebuild'}, 'draft': False}
+                    for n in range((page - 1) * 100 + 1, page * 100 + 1)]
+
+        def run(command, **kwargs):
+            joined = ' '.join(command)
+            self.assertIn('search/issues', joined)
+            match = re.search(r'(?<![_\w])page=(\d+)', joined)
+            page = int(match.group(1)) if match else 1
+            return mock.Mock(returncode=0, stdout=json.dumps(
+                {'total_count': 1050, 'incomplete_results': False,
+                 'items': page_items(page)}), stderr='')
+
+        with mock.patch.object(promotion_source.subprocess, 'run', run):
+            result = promotion_source.collect(self.state)
+        self.assertEqual(result['items'], good['items'])
+        self.assertTrue(result['errors'])
+        self.assertIn('incomplete', result['errors'][0])
+        self.assertEqual(result['last_success_at'], good['last_success_at'])
 
     def test_cache_holds_for_60_seconds(self):
         data = {'captured_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -1199,6 +1283,65 @@ class ReviewerRoutingAndCapacity(unittest.TestCase):
         self.assertEqual(entries[0]['issue'], DONAVON_PR)
         self.assertTrue((self.state / 'dispatch' / (recorded[0]['worker_id'] + '.md')).exists())
         # A second pass at full capacity does not duplicate the entry.
+        self.assertEqual(module.record_high_tier('session-x'), [])
+        self.assertEqual(len(module.read_queue()), 1)
+
+    def test_re_request_after_completed_review_requeues_at_full_capacity(self):
+        """A Donavon re-request on a PR whose earlier review completed enters the
+        durable queue again while every slot stays claimed; an unchanged completed
+        review never requeues."""
+        module = self._module()
+        module.QUEUE_PATH = self.state / 'dispatch' / 'queue.json'
+        module.archived_repos = lambda: set()
+        (self.state / 'review-intake.json').write_text(json.dumps({'items': [
+            {'url': DONAVON_PR, 'title': 'Fix thing', 'donavon_request': True,
+             'priority': 'High', 'updated_at': '2026-10-15T11:00:00Z'}]}))
+        recorded = module.record_high_tier('session-x')
+        self.assertEqual(len(recorded), 1)
+        module.set_queue_state(recorded[0]['worker_id'], state='completed')
+        # Donavon re-requests review on a new head: the PR's updated_at advances.
+        (self.state / 'review-intake.json').write_text(json.dumps({'items': [
+            {'url': DONAVON_PR, 'title': 'Fix thing', 'donavon_request': True,
+             'priority': 'High', 'updated_at': '2026-10-15T12:00:00Z'}]}))
+        recorded = module.record_high_tier('session-x')
+        self.assertEqual(len(recorded), 1)
+        entries = module.read_queue()
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]['state'], 'pending')
+        self.assertEqual(entries[0]['issue_updated_at'], '2026-10-15T12:00:00Z')
+        # With the re-request settled and the PR unchanged, no pass requeues it.
+        module.set_queue_state(entries[0]['worker_id'], state='completed')
+        self.assertEqual(module.record_high_tier('session-x'), [])
+        self.assertEqual(len(module.read_queue()), 1)
+
+    def test_promotion_head_change_requeues_after_completed_review(self):
+        """A verified promotion whose PR gets a new head while every slot is claimed
+        re-enters the durable queue; the completed review of the old head does not
+        hold it out."""
+        module = self._module()
+        module.STATE = self.state
+        module.QUEUE_PATH = self.state / 'dispatch' / 'queue.json'
+        module.archived_repos = lambda: set()
+        promo = promotion_node()['url']
+
+        def snapshot_for(updated):
+            (self.state / 'promotion-snapshot.json').write_text(json.dumps({'items': [
+                {'url': promo, 'title': 'Promotion', 'kind': 'promotion',
+                 'priority': 'Promotion', 'next_owner': 'bhalecb',
+                 'updatedAt': updated}]}))
+
+        snapshot_for('2026-10-15T10:00:00Z')
+        recorded = module.record_high_tier('session-x')
+        self.assertEqual(len(recorded), 1)
+        module.set_queue_state(recorded[0]['worker_id'], state='completed')
+        # A pushed head changes the PR's updatedAt.
+        snapshot_for('2026-10-15T13:00:00Z')
+        recorded = module.record_high_tier('session-x')
+        self.assertEqual(len(recorded), 1)
+        entries = module.read_queue()
+        self.assertEqual(entries[0]['state'], 'pending')
+        self.assertEqual(entries[0]['issue_updated_at'], '2026-10-15T13:00:00Z')
+        # Unchanged, the requeued promotion is not duplicated on later passes.
         self.assertEqual(module.record_high_tier('session-x'), [])
         self.assertEqual(len(module.read_queue()), 1)
 

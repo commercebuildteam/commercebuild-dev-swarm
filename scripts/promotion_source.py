@@ -84,7 +84,7 @@ def gh(*args, deadline=None):
 
 def search_open_prs(deadline=None):
     """Bounded, paginated open-PR search across all non-archived org repositories."""
-    rows, cursor = [], None
+    rows, cursor, total = [], None, 0
     for _ in range(MAX_SEARCH_PAGES):
         # gh() prepends the gh executable itself; the command must not repeat it.
         command = ['api', '--method', 'GET', 'search/issues', '-f',
@@ -96,9 +96,18 @@ def search_open_prs(deadline=None):
         if data.get('incomplete_results'):
             raise RuntimeError('GitHub promotion search returned incomplete results')
         rows.extend(data['items'])
-        if len(rows) >= data['total_count'] or not data['items']:
+        total = data.get('total_count') or 0
+        if len(rows) >= total or not data['items']:
             break
         cursor = len(rows) // 100 + 1
+    if rows and total and len(rows) < total:
+        # The page cap silently omitting a promotion is never acceptable: raise so
+        # the refresh keeps the previous snapshot and records the incomplete search
+        # instead of looking like a complete, successful pass.
+        raise RuntimeError(
+            f'GitHub promotion search stopped after {len(rows)} of {total} open PRs '
+            f'(page cap of {MAX_SEARCH_PAGES * 100} results); discovery is incomplete '
+            'and the previous snapshot is retained')
     result = []
     for item in rows:
         repo = '/'.join(item['repository_url'].split('/')[-2:])
@@ -137,8 +146,11 @@ def list_open_prs(repo, deadline=None):
 
 
 def branch_evidence(detail):
-    """Verified promotion branch structure: a release/stable target with a
-    promotion-prepared, default, encoded/custom, or replacement head.
+    """Promotion branch structure: a release/stable target with a promotion-prepared,
+    default, encoded/custom, or replacement head. A custom head that matches none of
+    those naming patterns is kept as a pending-branch candidate (`head_kinds` empty):
+    naming is not the only proof, so such a head stays eligible for classification
+    through verified lineage instead of being discarded before it is checked.
 
     The head SHA and owning repository are verified against the live PR detail;
     a branch name alone is naming, never proof the source branch exists.
@@ -156,8 +168,6 @@ def branch_evidence(detail):
         kinds.append('promotion-prepared')
     if ENCODED_HEAD.search(head):
         kinds.append('encoded-custom-head')
-    if not kinds:
-        return None
     verified = bool(re.fullmatch(r'[0-9a-f]{40}', sha) and head_repo)
     return {'head': head, 'base': base, 'head_kinds': kinds, 'sha': sha,
             'head_repo': head_repo, 'verified': verified}
@@ -269,14 +279,19 @@ def lineage_evidence(repo, detail, cache, deadline=None):
     return release_evidence(repo, detail.get('body') or '', base, head_sha, deadline)
 
 
-def classify(detail):
+def classify(detail, lineage=None):
     """Return a promotion item, or None when the PR is not a promotion.
 
     A PR that merely mentions 'promotion' with a non-promotion target branch is
     explicitly not classified; negative classification is part of the contract.
+    A custom head with no promotion naming classifies only on verified lineage
+    (promotion workflow run, source SHA record, or linked release); an unproven
+    custom head is never a promotion candidate.
     """
     evidence = branch_evidence(detail)
     if evidence is None:
+        return None
+    if not evidence['head_kinds'] and not (lineage and lineage.get('verified')):
         return None
     body = detail.get('body') or ''
     item = {
@@ -413,7 +428,9 @@ def _collect(path, now, old):
                               mergeable='unknown')
                 classification[row['url']] = {
                     'updatedAt': row['updatedAt'],
-                    'detail': detail if classify(detail) else None}
+                    # Branch structure gates phase 2; a custom head with no
+                    # promotion naming still enters so lineage can classify it.
+                    'detail': detail if branch_evidence(detail) else None}
         for repo, error in list_errors.items():
             result['errors'].append(f'{repo}: listing failed ({error})')
 
@@ -456,15 +473,17 @@ def _collect(path, now, old):
             detail.update(pr_detail(row['repo'], row['number'], deadline))
             detail.update(url=row['url'], updatedAt=row['updatedAt'],
                           verified_at=now.isoformat())
-            item = classify(detail)
-            if not item:
-                return None, None
             key = (row['repo'], (detail.get('sha') or '').strip())
             lineage = lineage_cache.get(key)
             if not (lineage and lineage.get('verified')) and run_lineage:
                 lineage = lineage_evidence(row['repo'], detail, lineage_cache, deadline)
                 if lineage and lineage.get('verified'):
                     lineage_cache[key] = lineage
+            # Classification runs after lineage so a custom head with no promotion
+            # naming is classified exactly when its lineage is verified.
+            item = classify(detail, lineage)
+            if not item:
+                return None, None
             return item, lineage
 
         jobs, lineage_deferred = {}, set()
@@ -501,6 +520,10 @@ def _collect(path, now, old):
                     result['items'].append(prior)
                     continue
                 item = classify(detail)
+                if item is None:
+                    # A custom head with no verified lineage is not a promotion
+                    # candidate and never becomes a stub row.
+                    continue
                 reason = 'verification deferred to the next refresh cycle'
             unverified[url] = reason
             deferred.append((row, item, reason))

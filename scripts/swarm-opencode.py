@@ -2032,7 +2032,20 @@ def record_high_tier(session):
     """
     existing = read_queue()
     busy_workers = {e.get('worker_id') for e in existing if e.get('state') in ('pending', 'running')}
-    queued_urls = {e.get('issue') for e in existing}
+    # Only a pending or running entry already covers its URL. A terminal entry
+    # (completed, blocked, failed) covers only the item state it recorded: a newer
+    # updatedAt (Donavon re-requesting review, a changed promotion head) re-queues
+    # the item, while an unchanged completed review stays settled out of the queue.
+    live_urls, terminal = set(), {}
+    for e in existing:
+        url = e.get('issue')
+        if e.get('state') in ('pending', 'running'):
+            live_urls.add(url)
+        elif url:
+            recorded_at = e.get('issue_updated_at') or ''
+            previous = terminal.get(url)
+            if previous is None or recorded_at > previous:
+                terminal[url] = recorded_at
     candidates = [i for i in review_intake.snapshot(STATE).get('items', [])
                   if i.get('donavon_request')]
     candidates += [i for i in promotion_source.items(STATE)
@@ -2043,7 +2056,12 @@ def record_high_tier(session):
     recorded = []
     for item in candidates:
         url = item.get('url') or ''
-        if not url or url in queued_urls:
+        updated_at = item.get('updatedAt') or item.get('updated_at') or ''
+        if not url or url in live_urls:
+            continue
+        covered_until = terminal.get(url)
+        if covered_until is not None and updated_at <= covered_until:
+            # The settled entry recorded exactly this item state; no re-request.
             continue
         repo = '/'.join(url.split('/')[3:5]).lower()
         worker_id = worker_id_for(url)
@@ -2062,7 +2080,7 @@ def record_high_tier(session):
                      'issue_updated_at': item.get('updatedAt') or item.get('updated_at') or '',
                      'state': 'pending', 'updated_at': stamp(), 'kind': 'review'}] + kept
         update_queue(mutate)
-        queued_urls.add(url)
+        live_urls.add(url)
         busy_workers.add(worker_id)
         recorded.append({'worker_id': worker_id, 'url': url})
     if recorded:
