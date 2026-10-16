@@ -957,7 +957,10 @@ def review_posted_on_head(url, head, since):
                 if head and row.get('commit_id') == head:
                     return True
             elif head and REVIEW_RESULT_RE.search(row.get('body') or '') \
-                    and str(head)[:7] in (row.get('body') or ''):
+                    and str(head) in (row.get('body') or ''):
+                # The exact full 40-character head SHA, not a prefix: a comment
+                # naming a different commit that shares the short SHA proves
+                # nothing about this head.
                 return True
     return False
 
@@ -1927,9 +1930,10 @@ def interleave_work_lanes(owed, recovery, new):
 
 def review_entry_urls(state):
     """URLs that dispatch as reviewer-only jobs: Donavon-requested reviews and
-    verified promotions whose next owner is bhalecb. Promotion repairs that need a
-    verified source change stay with donavon-commercebuild and are never dispatched
-    as developer implementation work by this swarm."""
+    promotions whose next owner is bhalecb, including candidates still unverified
+    by this refresh. Promotion repairs that need a verified source change stay
+    with donavon-commercebuild and are never dispatched as developer
+    implementation work by this swarm."""
     urls = {i['url'] for i in review_intake.snapshot(state).get('items', [])
             if i.get('donavon_request')}
     urls.update(i['url'] for i in promotion_source.items(state)
@@ -1995,10 +1999,13 @@ def issue_requires_reassessment(item):
 def record_high_tier(session):
     """Capacity-independent durable queue insertion for review-tier items.
 
-    Donavon-requested reviews and verified promotions must stay queued and visible
-    while every developer slot is claimed; the two-concurrent review cap remains a
+    Donavon-requested reviews, verified promotions, and promotion candidates
+    still unverified by this refresh must stay queued and visible while every
+    developer slot is claimed; the two-concurrent review cap remains a
     dispatch-time check, so freeing a slot starts an already-queued review without
-    re-discovery. No claim is taken here: prepare_entry claims at dispatch time.
+    re-discovery. Unverified candidates queue at a safe bottom-tier priority and
+    never rank above verified work. No claim is taken here: prepare_entry claims
+    at dispatch time.
     """
     existing = read_queue()
     busy_workers = {e.get('worker_id') for e in existing if e.get('state') in ('pending', 'running')}

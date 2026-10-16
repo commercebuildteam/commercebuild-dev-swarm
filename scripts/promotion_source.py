@@ -22,9 +22,14 @@ MAX_SEARCH_PAGES = 10
 # marked in the snapshot so an unknown promotion can never silently lose priority.
 MAX_DETAIL_PER_REFRESH = 200
 DETAIL_WORKERS = 8
-# Bounded sweep deadline per refresh; past it, remaining candidates are deferred.
-# The whole refresh (search plus sweep) must finish inside the 60-second intake
-# requirement, so the sweep deadline stays below the refresh interval.
+# Classification is cheap and covers every budgeted candidate; the expensive
+# lineage compares run inside this separate budget with rotation, so a long
+# promotion list never blocks the refresh window. Cached evidence for an
+# unchanged head applies instantly on later refreshes.
+MAX_LINEAGE_PER_REFRESH = 40
+# Bounded refresh deadline; past it, remaining candidates are deferred. The
+# deadline starts before the search, so the whole refresh (search plus sweep)
+# finishes inside the 60-second intake window with margin for the cadence.
 DISCOVERY_SECONDS = 45
 
 # A promotion PR targets a release or stable branch. Both channels take precedence.
@@ -181,12 +186,14 @@ def source_branch_ancestor(repo, ref, branch):
     return (result.stdout or '').strip().strip('"') in ('identical', 'ahead')
 
 
-def release_evidence(repo, body, base=''):
-    """A linked GitHub release in the PR body verifies only when the tag exists
-    and its commit belongs to this candidate's source branch: any existing
-    release link proves nothing about the promotion it appears in."""
+def release_evidence(repo, body, base='', head_sha=''):
+    """A linked GitHub release in the PR body verifies only when the tag exists,
+    its commit belongs to this candidate's source branch, and that commit is
+    contained in this PR's head (identical to it or an ancestor of it): an
+    existing release link, or a tag merely sitting on the source branch, proves
+    nothing about the promotion whose body links it."""
     match = RELEASE_REF.search(body or '')
-    if not match:
+    if not match or not re.fullmatch(r'[0-9a-f]{40}', (head_sha or '').strip()):
         return None
     tag = match.group(1)
     result = subprocess.run(['gh', 'api', 'repos/' + repo + '/releases/tags/' + tag,
@@ -194,7 +201,8 @@ def release_evidence(repo, body, base=''):
     if result.returncode:
         return None
     for branch in source_branches_for(base):
-        if source_branch_ancestor(repo, tag, branch):
+        if source_branch_ancestor(repo, tag, branch) \
+                and source_branch_ancestor(repo, tag, head_sha.strip()):
             return {'kind': 'linked-release', 'tag': tag, 'source_branch': branch,
                     'verified': True}
     return None
@@ -218,7 +226,7 @@ def lineage_evidence(repo, detail, cache):
             if source_branch_ancestor(repo, record.group(1), branch):
                 return {'kind': 'source-record', 'source_sha': record.group(1),
                         'source_branch': branch, 'verified': True}
-    return release_evidence(repo, detail.get('body') or '', base)
+    return release_evidence(repo, detail.get('body') or '', base, head_sha)
 
 
 def classify(detail):
@@ -282,6 +290,13 @@ def collect(state):
               'items': [], 'errors': [], 'truncated': False,
               'unverified': {}}
     try:
+        # The deadline starts before the search: the whole refresh (search plus
+        # sweep) must finish inside the 60-second intake window, so neither a
+        # long search nor an in-flight detail call may stretch it past the
+        # cadence. Past the deadline, verifications are cancelled without
+        # waiting; their candidates stay marked unverified so they are never
+        # silently unprioritized.
+        deadline = time.monotonic() + DISCOVERY_SECONDS
         rows = search_open_prs()
         open_urls = {row['url'] for row in rows}
         # Rotation: each refresh verifies the next slice of the open-PR list so a
@@ -302,54 +317,98 @@ def collect(state):
         deferred_rows = queue[MAX_DETAIL_PER_REFRESH:]
         candidates_total = len(ordered)
 
-        def verify(row):
-            """Detail, classification, and lineage for one candidate."""
+        def detail_for(row):
+            """Detail and classification for one candidate; cheap by design so
+            every open promotion is classified within this refresh."""
             detail = pr_detail(row['repo'], row['number'])
             detail.update({'url': row['url'], 'updatedAt': row['updatedAt'],
                            'verified_at': now.isoformat()})
-            item = classify(detail)
-            if not item:
-                return row, detail, item, None
-            return row, detail, item, lineage_evidence(row['repo'], detail, lineage_cache)
+            return row, detail, classify(detail)
 
-        results, failed, unverified = {}, {}, {}
-        deadline = time.monotonic() + DISCOVERY_SECONDS
-        with ThreadPoolExecutor(max_workers=DETAIL_WORKERS) as pool:
-            futures = {pool.submit(verify, row): row for row in submitted}
+        results, failed, unverified, deferred = {}, {}, {}, []
+        candidates, futures, pending = [], {}, set()
+
+        pool = ThreadPoolExecutor(max_workers=DETAIL_WORKERS)
+        try:
+            futures = {pool.submit(detail_for, row): row for row in submitted}
             pending = set(futures)
             while pending and time.monotonic() < deadline:
-                done, pending = wait(pending, timeout=1)
+                done, pending = wait(pending, timeout=min(1, max(0, deadline - time.monotonic())))
                 for future in done:
                     row = futures[future]
                     examined.add(row['url'])
                     try:
-                        _, detail, item, lineage = future.result()
+                        _, detail, item = future.result()
                     except (subprocess.SubprocessError, ValueError, OSError, KeyError) as exc:
                         failed[row['url']] = f'{row["url"]}: {type(exc).__name__}'
                         continue
-                    if not item:
-                        continue
-                    if not lineage or not lineage.get('verified'):
-                        unverified[row['url']] = ('promotion lineage unverified: no promotion '
-                                                  'workflow run, no source branch/SHA record, '
-                                                  'and no linked release')
-                        continue
-                    item['lineage'] = lineage
-                    fresh = [i for i in fresh if i['url'] != item['url']]
-                    fresh.append(item)
-            # Past the deadline, cancel outstanding verifications: those candidates stay
-            # marked unverified so they are never silently unprioritized.
+                    if item:
+                        candidates.append((row, detail, item))
+        finally:
             for future in pending:
                 future.cancel()
-            for row in futures.values():
-                if row['url'] not in examined:
-                    unverified[row['url']] = 'detail verification deferred to a later refresh'
-            # Beyond-budget candidates are deferred, not dropped: each stays
-            # individually visible with its recheck condition, so a promotion
-            # late in a large open-PR list can never silently lose priority.
-            for row in deferred_rows:
-                unverified[row['url']] = ('detail verification deferred beyond this refresh\'s '
-                                          'budget; recheck after the next refresh cycle')
+            # Do not wait for in-flight detail calls: they hold only local state,
+            # and the refresh must return inside the intake window.
+            pool.shutdown(wait=False, cancel_futures=True)
+        for row in futures.values():
+            if row['url'] not in examined:
+                reason = 'detail verification deferred to a later refresh'
+                unverified[row['url']] = reason
+                deferred.append((row, None, reason))
+        # Beyond-budget candidates are deferred, not dropped: each stays
+        # individually visible with its recheck condition, so a promotion
+        # late in a large open-PR list can never silently lose priority.
+        for row in deferred_rows:
+            reason = ('detail verification deferred beyond this refresh\'s '
+                      'budget; recheck after the next refresh cycle')
+            unverified[row['url']] = reason
+            deferred.append((row, None, reason))
+
+        # Phase 2: lineage for classified promotions only, inside its own budget
+        # and rotation so expensive compares never block the refresh window.
+        # Cached evidence for an unchanged head applies instantly, so a warm
+        # snapshot verifies without new lineage calls.
+        candidates.sort(key=lambda entry: entry[0]['url'])
+        lineage_start = int(old.get('lineage_cursor') or 0) % len(candidates) \
+            if candidates else 0
+        candidates = candidates[lineage_start:] + candidates[:lineage_start]
+        lineage_queue, lineage_slice = [], []
+        for row, detail, item in candidates:
+            key = (row['repo'], (item['branch_evidence'].get('sha') or '').strip())
+            cached = lineage_cache.get(key)
+            if cached and cached.get('verified'):
+                item['lineage'] = cached
+                fresh = [i for i in fresh if i['url'] != item['url']]
+                fresh.append(item)
+            else:
+                lineage_queue.append((row, detail, item, key))
+        for entry in lineage_queue[:MAX_LINEAGE_PER_REFRESH]:
+            lineage_slice.append(entry)
+        for row, _, item, _ in lineage_queue[MAX_LINEAGE_PER_REFRESH:]:
+            reason = ('lineage verification deferred beyond this refresh\'s '
+                      'budget; recheck after the next refresh cycle')
+            unverified[row['url']] = reason
+            deferred.append((row, item, reason))
+        for row, detail, item, _ in lineage_slice:
+            if time.monotonic() >= deadline:
+                reason = 'lineage verification deferred to the next refresh cycle'
+                unverified[row['url']] = reason
+                deferred.append((row, item, reason))
+                continue
+            try:
+                lineage = lineage_evidence(row['repo'], detail, lineage_cache)
+            except (subprocess.SubprocessError, ValueError, OSError, KeyError) as exc:
+                failed[row['url']] = f'{row["url"]}: {type(exc).__name__}'
+                continue
+            if lineage and lineage.get('verified'):
+                item['lineage'] = lineage
+                fresh = [i for i in fresh if i['url'] != item['url']]
+                fresh.append(item)
+            else:
+                reason = ('promotion lineage unverified: no promotion workflow '
+                          'run, no source branch/SHA record, and no linked release')
+                unverified[row['url']] = reason
+                deferred.append((row, item, reason))
         fresh_urls = {i['url'] for i in fresh}
         # Rebuild from live search: a merged or closed promotion disappears instead
         # of ranking forever. Still-open items this refresh could not verify stay
@@ -358,10 +417,35 @@ def collect(state):
                 if i['url'] in open_urls and i['url'] not in fresh_urls
                 and i['url'] not in examined and i.get('lineage', {}).get('verified')]
         result['items'] = fresh + kept
+        # Every candidate this refresh could not verify becomes a visible blocked
+        # row with a safe (bottom-tier) queue priority, so the dashboard and the
+        # durable queue both see a deferred promotion within this refresh instead
+        # of only the snapshot map. Title or branch naming never classifies here;
+        # an unclassified candidate is labelled unverified until the rotation
+        # reaches it, and a classified promotion keeps its branch evidence.
+        verified_urls = {i['url'] for i in result['items']}
+        for row, item, reason in deferred:
+            if row['url'] in verified_urls:
+                continue
+            if item:
+                stub = dict(item)
+                stub['blocked'] = list(item.get('blocked') or []) + [reason]
+            else:
+                stub = {'url': row['url'], 'title': row['title'] or '',
+                        'kind': 'promotion', 'next_owner': 'bhalecb',
+                        'blocked': [reason],
+                        'recheck_condition':
+                            'next refresh cycle verifies this candidate (rotation)'}
+            stub.update({'priority': 'Promotion (unverified)', 'unverified': True,
+                         'updatedAt': row['updatedAt'],
+                         'verified_at': now.isoformat()})
+            result['items'].append(stub)
         result['errors'].extend(failed.values())
         result['unverified'].update(unverified)
         result['truncated'] = len(examined) < candidates_total
         result['cursor'] = (start + len(examined)) % len(rows) if rows else 0
+        result['lineage_cursor'] = (lineage_start + len(lineage_slice)) % len(candidates) \
+            if candidates else 0
         result['lineage_cache'] = {f'{r}|{s}': v for (r, s), v in lineage_cache.items() if v}
     except (subprocess.SubprocessError, RuntimeError, ValueError, OSError) as exc:
         result['errors'].append(str(exc) if isinstance(exc, RuntimeError) else type(exc).__name__)

@@ -187,7 +187,8 @@ class PromotionCollection(unittest.TestCase):
         with mock.patch.object(promotion_source.subprocess, 'run', self.fake_gh(
                 {**search, 'details': details})):
             result = promotion_source.collect(self.state)
-        self.assertEqual(result['items'], [])
+        # Unverified candidates surface as blocked rows; nothing verified ranks.
+        self.assertEqual([i for i in result['items'] if not i.get('unverified')], [])
         self.assertIn(promotion_node()['url'], result['unverified'])
         # With a recorded source SHA verifiably on the source branch it classifies.
         details['99'] = dict(details['99'], body='Prepared from source ' + '04d12f0abc' + '0' * 30)
@@ -214,7 +215,8 @@ class PromotionCollection(unittest.TestCase):
         with mock.patch.object(promotion_source.subprocess, 'run', self.fake_gh(
                 {**search, 'details': details})):
             result = promotion_source.collect(self.state)
-        self.assertEqual(result['items'], [])
+        # Unverified candidates surface as blocked rows; nothing verified ranks.
+        self.assertEqual([i for i in result['items'] if not i.get('unverified')], [])
         self.assertIn(url, result['unverified'])
 
     def test_workflow_run_for_this_head_verifies_lineage(self):
@@ -235,7 +237,8 @@ class PromotionCollection(unittest.TestCase):
 
     def test_linked_release_evidence_verifies_lineage(self):
         """A promotion PR body linking an existing release tag is lineage evidence
-        only when the tag's commit belongs to the direction's source branch."""
+        only when the tag's commit belongs to the direction's source branch and
+        is contained in this PR's head commit."""
         url = promotion_node()['url']
         search = {'total_count': 1, 'incomplete_results': False, 'items': [
             {'number': 99, 'html_url': url, 'title': 'Promotion: release 3.4',
@@ -256,8 +259,9 @@ class PromotionCollection(unittest.TestCase):
             if '/releases/tags/' in joined:
                 return mock.Mock(returncode=0, stdout='"v3.4.0"', stderr='')
             if '/compare/' in joined:
-                # The tag commit must be on the promotion's source branch.
-                if 'main' in joined:
+                # The tag commit must be on the promotion's source branch and
+                # contained in this PR's head commit.
+                if '...main' in joined or '...' + 'a' * 40 in joined:
                     return mock.Mock(returncode=0, stdout='"ahead"', stderr='')
                 return mock.Mock(returncode=0, stdout='"diverged"', stderr='')
             raise AssertionError('unexpected gh call: %r' % (command[:6],))
@@ -301,7 +305,47 @@ class PromotionCollection(unittest.TestCase):
                                                      body='Prepared from /releases/tag/v9.9.9.')}}
         with mock.patch.object(promotion_source.subprocess, 'run', run):
             result = promotion_source.collect(self.state)
-        self.assertEqual(result['items'], [])
+        # Unverified candidates surface as blocked rows; nothing verified ranks.
+        self.assertEqual([i for i in result['items'] if not i.get('unverified')], [])
+        self.assertIn(url, result['unverified'])
+
+    def test_source_branch_tag_not_in_pr_head_is_never_lineage(self):
+        """A release tag that exists on the direction's source branch but is not
+        contained in this PR's head stays unverified: an unrelated existing tag
+        can never lend its lineage to a different promotion."""
+        url = promotion_node()['url']
+        search = {'total_count': 1, 'incomplete_results': False, 'items': [
+            {'number': 99, 'html_url': url, 'title': 'Promotion: release 3.4',
+             'repository_url': 'https://api.github.com/repos/commercebuildteam/client-site',
+             'updated_at': '2026-10-15T10:00:00Z', 'user': {'login': 'commercebuild'},
+             'draft': False}]}
+
+        def run(command, **kwargs):
+            joined = ' '.join(command)
+            if 'search/issues' in joined:
+                return mock.Mock(returncode=0, stdout=json.dumps(search), stderr='')
+            if '/pulls/' in joined:
+                number = re.search(r'/pulls/(\d+)', joined).group(1)
+                return mock.Mock(returncode=0,
+                                 stdout=json.dumps(dict(searches['details'][number])), stderr='')
+            if '/actions/runs' in joined:
+                return mock.Mock(returncode=0, stdout='[]', stderr='')
+            if '/releases/tags/' in joined:
+                return mock.Mock(returncode=0, stdout='"v3.4.0"', stderr='')
+            if '/compare/' in joined:
+                # The tag sits on the source branch but diverged from this PR's
+                # head: the release content is not in this promotion.
+                if '...main' in joined:
+                    return mock.Mock(returncode=0, stdout='"ahead"', stderr='')
+                return mock.Mock(returncode=0, stdout='"diverged"', stderr='')
+            raise AssertionError('unexpected gh call: %r' % (command[:6],))
+
+        searches = {**search, 'details': {'99': dict(promotion_node(), url=url,
+                                                     body='Prepared from /releases/tag/v3.4.0.')}}
+        with mock.patch.object(promotion_source.subprocess, 'run', run):
+            result = promotion_source.collect(self.state)
+        # Unverified candidates surface as blocked rows; nothing verified ranks.
+        self.assertEqual([i for i in result['items'] if not i.get('unverified')], [])
         self.assertIn(url, result['unverified'])
 
     def test_release_to_stable_source_record_verifies_against_release_branch(self):
@@ -373,8 +417,57 @@ class PromotionCollection(unittest.TestCase):
             body='Prepared from source ' + sha + '.')}}
         with mock.patch.object(promotion_source.subprocess, 'run', run):
             result = promotion_source.collect(self.state)
-        self.assertEqual(result['items'], [])
+        # Unverified candidates surface as blocked rows; nothing verified ranks.
+        self.assertEqual([i for i in result['items'] if not i.get('unverified')], [])
         self.assertIn(url, result['unverified'])
+
+    def test_lineage_budget_rotates_and_deferred_promotions_surface(self):
+        """Classification covers every budgeted candidate cheaply; lineage runs
+        inside its own budget with rotation, so a classified promotion whose
+        lineage check is deferred still surfaces as a visible blocked row with
+        its branch evidence, and the next refresh verifies it."""
+        url_a = 'https://github.com/commercebuildteam/client-site/pull/99'
+        url_b = 'https://github.com/commercebuildteam/other-site/pull/55'
+        search = {'total_count': 2, 'incomplete_results': False, 'items': [
+            {'number': 99, 'html_url': url_a, 'title': 'Promotion: release 3.4',
+             'repository_url': 'https://api.github.com/repos/commercebuildteam/client-site',
+             'updated_at': '2026-10-15T10:00:00Z', 'user': {'login': 'commercebuild'},
+             'draft': False},
+            {'number': 55, 'html_url': url_b, 'title': 'Promotion: release 3.5',
+             'repository_url': 'https://api.github.com/repos/commercebuildteam/other-site',
+             'updated_at': '2026-10-15T10:00:00Z', 'user': {'login': 'commercebuild'},
+             'draft': False}]}
+        details = {'99': dict(promotion_node(), url=url_a),
+                   '55': dict(promotion_node(head='cb-promotion/release-3.5'), url=url_b)}
+        state_file = self.state / 'promotion-snapshot.json'
+
+        def stale():
+            data = json.loads(state_file.read_text())
+            data['captured_at'] = '2020-01-01T00:00:00+00:00'
+            state_file.write_text(json.dumps(data))
+
+        with mock.patch.object(promotion_source.subprocess, 'run',
+                               self.fake_gh({**search, 'details': details,
+                                             'workflow_run': True})), \
+             mock.patch.object(promotion_source, 'MAX_LINEAGE_PER_REFRESH', 1):
+            first = promotion_source.collect(self.state)
+            self.assertEqual(
+                {i['url'] for i in first['items'] if not i.get('unverified')}, {url_a})
+            stub = next(i for i in first['items'] if i.get('unverified'))
+            self.assertEqual(stub['url'], url_b)
+            self.assertEqual(stub['priority'], 'Promotion (unverified)')
+            self.assertEqual(stub['next_owner'], 'bhalecb')
+            self.assertIn('lineage verification deferred beyond',
+                          stub['blocked'][0])
+            self.assertTrue(stub['branch_evidence'])
+            self.assertIn(url_b, first['unverified'])
+            self.assertEqual(first['lineage_cursor'], 1)
+            stale()
+            second = promotion_source.collect(self.state)
+        self.assertEqual(
+            {i['url'] for i in second['items'] if not i.get('unverified')},
+            {url_a, url_b})
+        self.assertEqual(second['unverified'], {})
 
     def test_deferred_candidate_beyond_detail_budget_stays_visible(self):
         """A new custom promotion after 200 ordinary open PRs is deferred by this
@@ -423,10 +516,71 @@ class PromotionCollection(unittest.TestCase):
         with mock.patch.object(promotion_source.subprocess, 'run', run):
             result = promotion_source.collect(self.state)
         self.assertTrue(result['truncated'])
-        self.assertEqual(result['items'], [])
         self.assertIn(promo_url, result['unverified'])
         self.assertIn('deferred', result['unverified'][promo_url])
         self.assertIn('recheck', result['unverified'][promo_url].lower())
+        # The deferred candidate is visible, not just marked: it becomes a
+        # blocked row that the dashboard merge and the durable queue both see
+        # within this refresh, at a safe bottom-tier priority (never ranked
+        # above verified work while its lineage is unproven).
+        stubs = [i for i in result['items'] if i['url'] == promo_url]
+        self.assertEqual(len(stubs), 1)
+        stub = stubs[0]
+        self.assertEqual(stub['priority'], 'Promotion (unverified)')
+        self.assertTrue(stub['unverified'])
+        self.assertEqual(stub['next_owner'], 'bhalecb')
+        self.assertIn('deferred', stub['blocked'][0])
+        self.assertIn('refresh', stub['recheck_condition'].lower())
+        merged = priority_schedule.merged_snapshot(self.state)
+        rows = {i['url']: i for i in merged['items']}
+        self.assertIn(promo_url, rows)
+        self.assertEqual(rows[promo_url]['priority'], 'Promotion (unverified)')
+        self.assertEqual(priority_schedule.rank_map(self.state)[promo_url], 5)
+
+    def test_collect_returns_inside_the_deadline_with_a_slow_detail_call(self):
+        """A detail call still in flight at the sweep deadline never stretches the
+        refresh: collect() returns bounded inside the intake window and the
+        candidate stays marked deferred with a visible blocked row."""
+        url = promotion_node()['url']
+        gate = threading.Event()
+        search = {'total_count': 1, 'incomplete_results': False, 'items': [
+            {'number': 99, 'html_url': url, 'title': 'Promotion: release 3.4',
+             'repository_url': 'https://api.github.com/repos/commercebuildteam/client-site',
+             'updated_at': '2026-10-15T10:00:00Z', 'user': {'login': 'commercebuild'},
+             'draft': False}]}
+
+        def run(command, **kwargs):
+            joined = ' '.join(command)
+            if 'search/issues' in joined:
+                return mock.Mock(returncode=0, stdout=json.dumps(search), stderr='')
+            if '/pulls/' in joined:
+                gate.wait(2.0)
+                return mock.Mock(returncode=0,
+                                 stdout=json.dumps(dict(promotion_node(), url=url)), stderr='')
+            if '/actions/runs' in joined:
+                return mock.Mock(returncode=0, stdout='[]', stderr='')
+            if '/compare/' in joined:
+                return mock.Mock(returncode=0, stdout='"diverged"', stderr='')
+            if '/releases/tags/' in joined:
+                return mock.Mock(returncode=1, stdout='', stderr='Not Found')
+            raise AssertionError('unexpected gh call: %r' % (command[:6],))
+
+        with mock.patch.object(promotion_source.subprocess, 'run', run), \
+             mock.patch.object(promotion_source, 'DISCOVERY_SECONDS', 0.05):
+            began = time.monotonic()
+            result = promotion_source.collect(self.state)
+            elapsed = time.monotonic() - began
+            # Release the in-flight verification while the mock is still active
+            # so no background thread can reach the real gh executable.
+            gate.set()
+            time.sleep(0.2)
+        self.assertLess(elapsed, 1.0)
+        self.assertIn(url, result['unverified'])
+        self.assertIn('deferred', result['unverified'][url])
+        stubs = [i for i in result['items'] if i['url'] == url]
+        self.assertEqual(len(stubs), 1)
+        self.assertEqual(stubs[0]['priority'], 'Promotion (unverified)')
+        self.assertTrue(result['truncated'])
 
     def test_short_source_sha_in_body_is_never_lineage(self):
         """A short hex token in the body is not a source SHA: without a verifiable
@@ -442,7 +596,8 @@ class PromotionCollection(unittest.TestCase):
         with mock.patch.object(promotion_source.subprocess, 'run', self.fake_gh(
                 {**search, 'details': details, 'source_ancestor': True})):
             result = promotion_source.collect(self.state)
-        self.assertEqual(result['items'], [])
+        # Unverified candidates surface as blocked rows; nothing verified ranks.
+        self.assertEqual([i for i in result['items'] if not i.get('unverified')], [])
         self.assertIn(url, result['unverified'])
 
     def test_second_refresh_drops_a_merged_promotion(self):
@@ -871,6 +1026,34 @@ class ReviewerRoutingAndCapacity(unittest.TestCase):
         self.assertEqual(module.record_high_tier('session-x'), [])
         self.assertEqual(len(module.read_queue()), 1)
 
+    def test_unverified_promotion_stub_queues_durably(self):
+        """A snapshot carrying a deferred promotion candidate queues it durably
+        through record_high_tier as a pending reviewer-path entry, so a promotion
+        beyond this refresh's detail budget never silently loses priority."""
+        module = self._module()
+        module.STATE = self.state
+        module.QUEUE_PATH = self.state / 'dispatch' / 'queue.json'
+        module.archived_repos = lambda: set()
+        promo = promotion_node()['url']
+        (self.state / 'promotion-snapshot.json').write_text(json.dumps({'items': [
+            {'url': promo, 'title': 'Promotion', 'kind': 'promotion',
+             'priority': 'Promotion (unverified)', 'unverified': True,
+             'blocked': ["detail verification deferred beyond this refresh's budget"],
+             'next_owner': 'bhalecb', 'updatedAt': '2026-10-15T10:00:00Z'}]}))
+        recorded = module.record_high_tier('session-x')
+        self.assertEqual(len(recorded), 1)
+        entries = module.read_queue()
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]['issue'], promo)
+        self.assertEqual(entries[0]['kind'], 'review')
+        self.assertEqual(entries[0]['state'], 'pending')
+        self.assertEqual(entries[0]['claim_id'], '')
+        self.assertTrue(
+            (self.state / 'dispatch' / (recorded[0]['worker_id'] + '.md')).exists())
+        # The second pass does not duplicate the queued entry.
+        self.assertEqual(module.record_high_tier('session-x'), [])
+        self.assertEqual(len(module.read_queue()), 1)
+
     def test_direct_intake_at_zero_limit_records_high_tier(self):
         module = self._module()
         sentinel = [{'worker_id': 'w-x'}]
@@ -1036,6 +1219,13 @@ class ReviewerRoutingAndCapacity(unittest.TestCase):
         # The marker without the reviewed head is not head-specific evidence.
         with mock.patch.object(module.subprocess, 'run',
                                comment_run('Review result: findings posted.')):
+            status, _ = module.settle_status(entry, DONAVON_PR, started)
+        self.assertEqual(status, 'incomplete')
+        # A different full SHA sharing the short prefix is never this head's
+        # evidence: only the exact 40-character head SHA settles the job.
+        with mock.patch.object(module.subprocess, 'run',
+                               comment_run('Review result: findings posted for head '
+                                           + 'a' * 7 + 'b' * 33)):
             status, _ = module.settle_status(entry, DONAVON_PR, started)
         self.assertEqual(status, 'incomplete')
         # Head-bound marker posted before the run started proves nothing.
