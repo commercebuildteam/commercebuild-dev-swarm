@@ -2007,7 +2007,7 @@ def high_tier_rows(state, seen_urls):
     recorded while every slot is full is still queued and starts when a slot frees.
     """
     sources = ((promotion_source.items(state), 'updatedAt'),
-               ((i for i in review_intake.snapshot(state).get('items', [])
+               ((i for i in review_intake.runnable_items(review_intake.snapshot(state))
                  if i.get('donavon_request')), 'updated_at'))
     extra = []
     for candidates, updated_key in sources:
@@ -2105,7 +2105,8 @@ def record_high_tier(session):
         elif url and e.get('state') in REVIEW_HANDLED_STATES:
             terminal[url] = e
     handled = read(STATE / 'dispatch' / 'handled-reviews.json')
-    candidates = {i['url']: i for i in review_intake.snapshot(STATE).get('items', [])
+    review_snapshot = review_intake.snapshot(STATE)
+    candidates = {i['url']: i for i in review_intake.runnable_items(review_snapshot)
                   if i.get('donavon_request') and i.get('url')}
     for promotion in promotion_source.items(STATE):
         if promotion.get('next_owner') != 'bhalecb' or not promotion.get('url'):

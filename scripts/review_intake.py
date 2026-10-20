@@ -106,6 +106,10 @@ def atomic(p,v):
 def snapshot(state):
  try:return json.loads((pathlib.Path(state)/'review-intake.json').read_text())
  except (OSError,ValueError):return {}
+def runnable_items(data):
+ """Only current open-PR search results can become new jobs on a partial scan."""
+ verified=set(data.get('open_verified_urls') or [])
+ return [i for i in data.get('items',[]) if not data.get('partial') or i.get('url') in verified]
 MAX_CONCURRENT_REVIEWS=2
 def can_dispatch(issue,donavon_urls,running_reviews):
  """Donavon-requested review intake is independent of capacity: every request stays
@@ -187,7 +191,7 @@ def refresh(state):
   old_items={i.get('url'):i for i in old.get('items',[]) if isinstance(i,dict) and i.get('url')}
   previous_deferred=set(old.get('deferred_urls') or [])
   ranks={'Urgent':1,'High':2,'Medium':3,'Low':4}
-  items={};seen=set();pending={};deferred=[]
+  items={};seen=set();pending={};deferred=[];stale=set()
   searches=['commenter:'+DONAVON,'review-requested:bhalecb','review-requested:commercebuild',
             'assignee:bhalecb','assignee:commercebuild','author:'+DONAVON]
   search_pool=concurrent.futures.ThreadPoolExecutor(max_workers=len(searches))
@@ -228,6 +232,7 @@ def refresh(state):
     except (RuntimeError,subprocess.TimeoutExpired,ValueError,KeyError) as e:
      item=old_items.get(n['url']);errors=[str(e)]
     result['errors'].extend(errors)
+    if errors and n['url'] in old_items:stale.add(n['url'])
     if item:items[n['url']]=item
   except concurrent.futures.TimeoutError:
    pass
@@ -239,13 +244,19 @@ def refresh(state):
      except (RuntimeError,subprocess.TimeoutExpired,ValueError,KeyError) as e:
       item=old_items.get(n['url']);errors=[str(e)]
      result['errors'].extend(errors)
+     if errors and n['url'] in old_items:stale.add(n['url'])
      if item:items[n['url']]=item
     else:deferred.append(n['url'])
    detail_pool.shutdown(wait=False,cancel_futures=True)
   if deferred:result['errors'].append(f'{len(deferred)} candidate inspections deferred by deadline')
   result['deferred_urls']=deferred
+  # Search results verify which PRs were open in this scan. A failed lookup may
+  # preserve older request evidence, but it cannot verify an absent PR is open.
+  result['open_verified_urls']=sorted(seen)
+  result['stale_urls']=[]
   if result['errors']:
    items.update({url:item for url,item in old_items.items() if url not in items})
+   result['stale_urls']=sorted(stale|{url for url in old_items if url not in seen})
    result['partial']=True;result['last_success_at']=old.get('last_success_at')
   else:result['last_success_at']=now
   result['items']=sorted(items.values(),key=lambda i:(ranks.get(i.get('priority'),9),i.get('updated_at') or '',i['url']))
@@ -267,5 +278,7 @@ def start(state):
  threading.Thread(target=run,name='read-only-review-intake',daemon=True).start()
 def render(data):
  esc=lambda v:html.escape(str(v or ''))
- rows=''.join('<tr><td>'+esc(i.get('priority') or 'Unset')+'</td><td><a href="'+esc(i['url'])+'">'+esc(i['title'])+'</a></td><td>'+esc(i['state'])+'</td><td>'+esc(i['priority_reason'])+'</td></tr>' for i in data.get('items',[]))
+ stale=set(data.get('stale_urls') or [])
+ open_verified=set(data.get('open_verified_urls') or [])
+ rows=''.join('<tr><td>'+esc(i.get('priority') or 'Unset')+'</td><td><a href="'+esc(i['url'])+'">'+esc(i['title'])+'</a></td><td>'+esc(i.get('state'))+(' (stale; details incomplete)' if i['url'] in stale and i['url'] in open_verified else ' (stale; open state unverified)' if i['url'] in stale else '')+'</td><td>'+esc(i.get('priority_reason'))+'</td></tr>' for i in data.get('items',[]))
  return '<section><h2>Review intake</h2><p>Checked '+esc(data.get('checked_at'))+' | Last successful '+esc(data.get('last_success_at'))+' | Every 60 seconds while awake. All requests retained independently of developer capacity. Queued Donavon-requested reviews run as reviewer jobs: at most 2 concurrently within the developer worker cap, one per repository.</p><p>'+esc(data.get('errors') or '')+'</p><table><tr><th>Priority</th><th>PR</th><th>Routing</th><th>Reason</th></tr>'+rows+'</table></section>'

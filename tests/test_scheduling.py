@@ -1703,6 +1703,73 @@ class ReviewerRoutingAndCapacity(unittest.TestCase):
         self.assertEqual(priority['last_success_at'], old_priority['last_success_at'])
         self.assertEqual(review['last_success_at'], old_review['last_success_at'])
 
+    def test_partial_scan_does_not_queue_old_request_without_open_pr_evidence(self):
+        module = self._module()
+        module.QUEUE_PATH = self.state / 'dispatch' / 'queue.json'
+        module.archived_repos = lambda: set()
+        old = {'url': DONAVON_PR, 'title': 'Prior request',
+               'donavon_request': True, 'head': 'a' * 40,
+               'request_evidence': [{'kind': 'comment', 'id': '1'}]}
+        (self.state / 'review-intake.json').write_text(json.dumps({'items': [old]}))
+
+        def partial_search(term, deadline):
+            if term.startswith('author:'):
+                return [], False, 'unrelated lookup failed'
+            return [], False, None
+
+        with mock.patch.object(review_intake, 'search_candidates', partial_search):
+            snapshot = review_intake.refresh(self.state)
+        self.assertTrue(snapshot['partial'])
+        self.assertEqual([item['url'] for item in snapshot['items']], [DONAVON_PR])
+        self.assertIn(DONAVON_PR, snapshot['stale_urls'])
+        self.assertEqual(module.high_tier_rows(self.state, set()), [])
+        self.assertEqual(module.record_high_tier('session-x'), [])
+        self.assertEqual(module.read_queue(), [])
+
+        # The same prior request may still be open when search fails. Keep its
+        # evidence visible until a complete scan can verify its current state.
+        self.assertIn('Prior request', review_intake.render(snapshot))
+        self.assertIn('stale; open state unverified', review_intake.render(snapshot))
+
+        open_pr = dict(intake_node(actor='donavon-commercebuild'), body='',
+                       closingIssuesReferences={'nodes': []})
+
+        def complete_search(term, deadline):
+            return ([open_pr], False, None) if term.startswith('review-requested:') else ([], False, None)
+
+        with mock.patch.object(review_intake, 'search_candidates', complete_search), \
+             mock.patch.object(review_intake, 'comments_for', lambda *args: []):
+            verified = review_intake.refresh(self.state)
+        self.assertFalse(verified.get('partial'))
+        self.assertEqual(verified['stale_urls'], [])
+        self.assertEqual(len(module.record_high_tier('session-x')), 1)
+
+    def test_prior_open_request_survives_partial_detail_failure(self):
+        module = self._module()
+        module.QUEUE_PATH = self.state / 'dispatch' / 'queue.json'
+        module.archived_repos = lambda: set()
+        old = {'url': DONAVON_PR, 'title': 'Prior request',
+               'donavon_request': True, 'head': 'a' * 40,
+               'request_evidence': [{'kind': 'comment', 'id': '1'}]}
+        (self.state / 'review-intake.json').write_text(json.dumps({'items': [old]}))
+        open_pr = dict(intake_node(actor='donavon-commercebuild'), body='',
+                       closingIssuesReferences={'nodes': []})
+
+        def partial_search(term, deadline):
+            if term.startswith('author:'):
+                return [], False, 'unrelated lookup failed'
+            return ([open_pr], False, None) if term.startswith('review-requested:') else ([], False, None)
+
+        with mock.patch.object(review_intake, 'search_candidates', partial_search), \
+             mock.patch.object(review_intake, 'comments_for',
+                               side_effect=RuntimeError('comment fetch failed')):
+            snapshot = review_intake.refresh(self.state)
+        self.assertTrue(snapshot['partial'])
+        self.assertIn(DONAVON_PR, snapshot['open_verified_urls'])
+        self.assertIn(DONAVON_PR, snapshot['stale_urls'])
+        self.assertIn('stale; details incomplete', review_intake.render(snapshot))
+        self.assertEqual(len(module.record_high_tier('session-x')), 1)
+
     def test_comment_failure_does_not_hide_separate_formal_request(self):
         module = self._module()
         module.QUEUE_PATH = self.state / 'dispatch' / 'queue.json'
