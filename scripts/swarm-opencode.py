@@ -48,6 +48,9 @@ QUOTA_PAUSE_SECONDS = 300      # stop starting new workers this long after any p
 OWNER_SWEEP_SECONDS = 300      # how often open swarm PRs are re-classified by next-action owner
 HEARTBEAT_STALE_SECONDS = 600
 TERMINAL_STATES = ('awaiting-assessment', 'routed', 'completed', 'blocked', 'awaiting-merge', 'awaiting-review', 'failed', 'incomplete', 'timeout', 'idle-timeout', 'killed', 'skipped', 'quota')
+REVIEW_HANDLED_STATES = ('awaiting-assessment', 'routed', 'completed', 'blocked',
+                         'awaiting-merge', 'awaiting-review')
+REVIEW_RETRY_STATES = ('failed', 'incomplete', 'timeout', 'idle-timeout', 'quota')
 QUEUE_HISTORY_LIMIT = 50       # recent terminal entries stay live; older receipts are archived
 QUOTA_HITS = set()             # worker_ids whose last run hit a provider credit error (HTTP 402)
 QUOTA_PAUSE_UNTIL = [0.0]      # time.time() until which no new worker is started
@@ -178,6 +181,15 @@ def compact_queue():
     """
     with lock(QUEUE_PATH.with_suffix('.lock')):
         entries = read_queue()
+        # Queue history is bounded, but the settled review identity must survive
+        # archiving and launcher restarts. Persist it before removing any receipt.
+        handled_path = STATE / 'dispatch' / 'handled-reviews.json'
+        handled = read(handled_path)
+        for entry in entries:
+            if entry.get('kind') == 'review' and entry.get('state') in REVIEW_HANDLED_STATES \
+                    and entry.get('review_signature'):
+                handled[entry['issue']] = entry['review_signature']
+        atomic(handled_path, handled)
         terminal = sorted((i for i, entry in enumerate(entries)
                            if entry.get('state') in TERMINAL_STATES),
                           key=lambda i: entries[i].get('updated_at') or '', reverse=True)
@@ -679,16 +691,20 @@ def poll_loop(stop, interval=60):
         deadline = max(deadline + interval, time.monotonic() + min(1, interval))
 
 
-def run_cadence(stop, interval, tasks, status_name):
+def run_cadence(stop, interval, tasks, status_name, immediate=False):
     """Run tasks in order every interval seconds (start to start) and record bounded
     freshness evidence instead of raising into the dispatch path."""
-    deadline = time.monotonic() + interval
+    deadline = time.monotonic() + (0 if immediate else interval)
     while not stop.wait(max(0, deadline - time.monotonic())):
         errors, seconds = {}, {}
         for name, task in tasks:
+            if stop.is_set():
+                break
             began = time.monotonic()
             try:
-                task()
+                result = task()
+                if isinstance(result, dict) and result.get('errors'):
+                    errors[name] = result['errors']
             except Exception as exc:
                 errors[name] = type(exc).__name__
             seconds[name] = round(time.monotonic() - began, 3)
@@ -712,19 +728,18 @@ def promotion_intake_loop(stop, interval=60):
 
 
 def freshness_loop(stop, interval=60):
-    """Independent 60-second ticket-priority and review-intake refresh.
-
-    priority_schedule.refresh is cached and internally rate-limited. A long or idle
-    dispatch round must not miss the refresh, so this loop runs outside the round.
-    Promotions have their own loop (promotion_intake_loop)."""
+    """Ticket priority has its own bounded 60-second refresh cadence."""
     run_cadence(stop, interval,
-                (('priority', lambda: priority_schedule.refresh(STATE, background=False)),
-                 ('review_intake', lambda: review_intake.refresh(STATE)),
-                 # The poller also inserts newly discovered requests into the
-                 # durable pending queue, so a request arriving during a long
-                 # full pool never waits for a free slot to become visible.
+                (('priority', lambda: priority_schedule.refresh(STATE, background=False)),),
+                'freshness-status.json', immediate=True)
+
+
+def review_intake_loop(stop, interval=60):
+    """Review discovery and queue insertion never wait for ticket priority."""
+    run_cadence(stop, interval,
+                (('review_intake', lambda: review_intake.refresh(STATE)),
                  ('queue_intake', lambda: record_high_tier(None))),
-                'freshness-status.json')
+                'review-intake-status.json', immediate=True)
 
 
 BLOCKED_RE = re.compile(
@@ -1436,6 +1451,7 @@ def run_entry(args, model, session, item):
             'attempts': attempts, 'session_id': worker_session,
             'runs': runs_today(previous) + (0 if status == 'quota' else 1),
             'issue_updated_at': entry.get('issue_updated_at') or previous.get('issue_updated_at'),
+            'review_signature': entry.get('review_signature'),
             'pr_urls': pr_urls,
             'started_at': started_at, 'finished_at': stamp(), 'github_check': verdict,
             'owed': entry.get('owed'), 'owed_head': entry.get('owed_head'),
@@ -1474,9 +1490,7 @@ def dispatch_round(args, model, session):
     round only when nothing is running, nothing is pending, and intake found nothing."""
     priority_schedule.refresh(STATE, background=False)
     promotion_source.collect(STATE)
-    # The review-intake poller starts with dispatch too, not only the dashboard
-    # server, so a Donavon request is queued even when nobody is watching the page.
-    review_intake.start(STATE)
+    # run_round owns the independent review-intake loop for this launcher.
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=SLOTS)
     futures = {}
     known = set()  # queue entries already handled this round, keyed by entry_key()
@@ -2007,6 +2021,21 @@ def high_tier_rows(state, seen_urls):
     return extra
 
 
+def review_signature(item):
+    """Stable review identity. PR activity timestamps aren't request evidence."""
+    branch = item.get('branch_evidence') or {}
+    evidence = sorted((str(e.get('kind') or ''), str(e.get('id') or ''),
+                       str(e.get('created_at') or ''))
+                      for e in item.get('request_evidence') or [] if isinstance(e, dict))
+    return json.dumps({
+        'head': item.get('head') or branch.get('sha') or '',
+        'requests': evidence,
+        'gate': {'state': item.get('state'), 'draft': item.get('draft'),
+                 'mergeable': item.get('mergeable'), 'blocked': item.get('blocked'),
+                 'next_owner': item.get('next_owner'), 'unverified': item.get('unverified')},
+    }, sort_keys=True)
+
+
 def issue_requires_reassessment(item):
     """A linked PR is not evidence that newer issue instructions are satisfied."""
     cp = read(STATE / 'checkpoints' / (worker_id_for(item['url']) + '.json'))
@@ -2032,52 +2061,67 @@ def record_high_tier(session):
     """
     existing = read_queue()
     busy_workers = {e.get('worker_id') for e in existing if e.get('state') in ('pending', 'running')}
-    # Only a pending or running entry already covers its URL. A terminal entry
-    # (completed, blocked, failed) covers only the item state it recorded: a newer
-    # updatedAt (Donavon re-requesting review, a changed promotion head) re-queues
-    # the item, while an unchanged completed review stays settled out of the queue.
+    # Only a pending or running entry already covers its URL. Terminal receipts
+    # and the durable handled map cover the exact head, request, and gate state.
     live_urls, terminal = set(), {}
     for e in existing:
         url = e.get('issue')
         if e.get('state') in ('pending', 'running'):
             live_urls.add(url)
-        elif url:
-            recorded_at = e.get('issue_updated_at') or ''
-            previous = terminal.get(url)
-            if previous is None or recorded_at > previous:
-                terminal[url] = recorded_at
-    candidates = [i for i in review_intake.snapshot(STATE).get('items', [])
-                  if i.get('donavon_request')]
-    candidates += [i for i in promotion_source.items(STATE)
-                   if i.get('next_owner') == 'bhalecb']
+        elif url and e.get('state') in REVIEW_HANDLED_STATES:
+            terminal[url] = e.get('review_signature')
+    handled = read(STATE / 'dispatch' / 'handled-reviews.json')
+    candidates = {i['url']: i for i in review_intake.snapshot(STATE).get('items', [])
+                  if i.get('donavon_request') and i.get('url')}
+    for promotion in promotion_source.items(STATE):
+        if promotion.get('next_owner') != 'bhalecb' or not promotion.get('url'):
+            continue
+        item = dict(promotion)
+        request = candidates.get(item['url'])
+        if request:
+            # One PR can be both a promotion and a Donavon request. Keep the
+            # promotion gate and both sources of head/request evidence in one job.
+            item['head'] = (item.get('branch_evidence') or {}).get('sha') or request.get('head')
+            item['request_evidence'] = request.get('request_evidence') or []
+        candidates[item['url']] = item
     # Every qualifying request is recorded; one worker per repository is enforced
     # at dispatch time, not by hiding pending requests here.
     archived = archived_repos() if candidates else set()
     recorded = []
-    for item in candidates:
+    for item in candidates.values():
         url = item.get('url') or ''
-        updated_at = item.get('updatedAt') or item.get('updated_at') or ''
         if not url or url in live_urls:
             continue
-        covered_until = terminal.get(url)
-        if covered_until is not None and updated_at <= covered_until:
-            # The settled entry recorded exactly this item state; no re-request.
+        signature = review_signature(item)
+        if terminal.get(url) == signature or handled.get(url) == signature:
             continue
         repo = '/'.join(url.split('/')[3:5]).lower()
         worker_id = worker_id_for(url)
+        checkpoint = read(STATE / 'checkpoints' / (worker_id + '.json'))
+        if checkpoint.get('status') in REVIEW_RETRY_STATES \
+                and (not checkpoint.get('review_signature')
+                     or checkpoint['review_signature'] == signature) \
+                and not ticket_eligible(worker_id, '', datetime.datetime.now(datetime.timezone.utc)):
+            continue
         if not repo or not worker_id or worker_id in busy_workers \
                 or repo in archived:
             continue
         write_prompt(worker_id, repo, url, item.get('title') or '', mode='review')
 
-        def mutate(entries, worker_id=worker_id, repo=repo, url=url, item=item):
+        def mutate(entries, worker_id=worker_id, repo=repo, url=url, item=item,
+                   signature=signature):
             if any(e.get('worker_id') == worker_id
                    and e.get('state') in ('pending', 'running') for e in entries):
+                return None
+            if any(e.get('worker_id') == worker_id
+                   and e.get('review_signature') == signature
+                   and e.get('state') in REVIEW_HANDLED_STATES for e in entries):
                 return None
             kept = [e for e in entries if e.get('worker_id') != worker_id]
             return [{'worker_id': worker_id, 'repo': repo, 'issue': url, 'claim_id': '',
                      'prompt_file': worker_id + '.md',
                      'issue_updated_at': item.get('updatedAt') or item.get('updated_at') or '',
+                     'review_signature': signature,
                      'state': 'pending', 'updated_at': stamp(), 'kind': 'review'}] + kept
         update_queue(mutate)
         live_urls.add(url)
@@ -2491,6 +2535,9 @@ def run_round(args, final_status='stopped'):
         freshness = threading.Thread(target=freshness_loop, args=(stop,), daemon=True,
                                      name='freshness-poller')
         freshness.start()
+        reviews = threading.Thread(target=review_intake_loop, args=(stop,), daemon=True,
+                                   name='review-intake')
+        reviews.start()
         promotions = threading.Thread(target=promotion_intake_loop, args=(stop,),
                                       daemon=True, name='promotion-intake')
         promotions.start()
@@ -2519,7 +2566,9 @@ def run_round(args, final_status='stopped'):
         finally:
             stop.set()
             watcher.join(timeout=30)
-            freshness.join(timeout=30)
+            freshness.join()
+            reviews.join()
+            promotions.join()
             release_all_claims('round ended; launcher reconciliation', session=session)
             with RUNTIME_MUTEX:
                 current = read(STATE / 'runtime.json')

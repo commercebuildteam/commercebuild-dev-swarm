@@ -1,6 +1,7 @@
 """Read GitHub organization issue Priority; evidence only, no queue writes."""
-import datetime,json,pathlib,re,subprocess
+import datetime,json,pathlib,re,subprocess,time
 RANK={'Promotion':0,'Urgent':1,'High':2,'Medium':3,'Low':4}
+DISCOVERY_SECONDS=40
 FIELDS='issueFieldValues(first:30){nodes{... on IssueFieldSingleSelectValue{name field{... on IssueFieldSingleSelect{name}}}}}'
 LABELS='labels(first:10){nodes{name}}'
 LABEL_PRIORITY=re.compile(r'^(?:p(?:riority)?[:_ -]*)?(urgent|high|medium|low)$',re.I)
@@ -8,18 +9,22 @@ def priority(node):
  values=[v['name'] for v in node.get('issueFieldValues',{}).get('nodes',[]) if v.get('field',{}).get('name')=='Priority']
  values+=[m.group(1).capitalize() for m in (LABEL_PRIORITY.match(n.get('name','')) for n in node.get('labels',{}).get('nodes',[])) if m]
  return min(values,key=lambda v:RANK.get(v,99)) if values else None
-def query(q):
- p=subprocess.run(['gh','api','graphql','-f','query='+q],capture_output=True,text=True,timeout=25)
+def query(q,deadline=None):
+ remaining=deadline-time.monotonic() if deadline is not None else 25
+ if remaining<=0:raise subprocess.TimeoutExpired('gh priority scan',0)
+ p=subprocess.run(['gh','api','graphql','-f','query='+q],capture_output=True,text=True,timeout=min(25,remaining))
  if p.returncode:raise RuntimeError('GitHub priority query failed (authentication, schema, or transport)')
  d=json.loads(p.stdout)
  if d.get('errors'):raise RuntimeError('GitHub priority response contains errors')
  return d['data']
 def collect(base):
  path=pathlib.Path(base)/'priority-snapshot.json';now=datetime.datetime.now(datetime.timezone.utc)
+ old={}
  if path.exists():
   old=json.loads(path.read_text())
   if (now-datetime.datetime.fromisoformat(old['captured_at'])).total_seconds()<60:return old
  result={'captured_at':now.isoformat(),'scope':'Open assigned commercebuild issues and open PRs by commercebuild or donavon-commercebuild, plus any PR requested for bhalecb or commercebuild review or commented on by donavon-commercebuild; maximum 300 each. Linked issues may be assigned to another owner. Evidence only.','items':[],'errors':[],'truncated':{}}
+ deadline=time.monotonic()+DISCOVERY_SECONDS
  issues={};prs=[]
  try:
   for kind,search,fragment in [
@@ -36,7 +41,7 @@ def collect(base):
    cursor=None
    for page in range(3):
     after=',after:'+json.dumps(cursor) if cursor else ''
-    data=query('{search(query:'+json.dumps(search)+',type:ISSUE,first:100'+after+'){pageInfo{hasNextPage endCursor} nodes{'+fragment+'}}}')['search']
+    data=query('{search(query:'+json.dumps(search)+',type:ISSUE,first:100'+after+'){pageInfo{hasNextPage endCursor} nodes{'+fragment+'}}}',deadline)['search']
     for n in data['nodes']:
      if kind=='issues':issues[n['url']]=n
      elif n['url'] not in {x['url'] for x in prs}:prs.append(n)
@@ -57,7 +62,7 @@ def collect(base):
    for i,url in enumerate(batch):
     repo,number=url.split('/')[4],int(url.rsplit('/',1)[1])
     parts.append('r'+str(i)+':repository(owner:"commercebuildteam",name:'+json.dumps(repo)+'){issue(number:'+str(number)+'){url '+FIELDS+'}}')
-   data=query('{'+''.join(parts)+'}')
+   data=query('{'+''.join(parts)+'}',deadline)
    for value in data.values():
     if value and value.get('issue'):issues[value['issue']['url']]=value['issue']
   for n in prs:
@@ -74,6 +79,10 @@ def collect(base):
    winner=min(valued,key=lambda x:RANK[priority(x)]) if valued else None
    result['items'].append({'url':n['url'],'title':n['title'],'priority':priority(winner) if winner else None,'source':winner['url'] if winner else None,'kind':'pr','linked_issues':list(links),'review_decision':n.get('reviewDecision'),'draft':n['isDraft']})
  except (RuntimeError,subprocess.TimeoutExpired,ValueError) as exc:result['errors'].append(str(exc) if isinstance(exc,RuntimeError) else type(exc).__name__)
+ if result['errors']:
+  result['items']=old.get('items',[])
+  result['last_success_at']=old.get('last_success_at',old.get('captured_at'))
+ else:result['last_success_at']=now.isoformat()
  result['items'].sort(key=lambda x:(RANK.get(x['priority'],99),x['url']))
  result['unset_count']=sum(x['priority'] is None for x in result['items'])
  result['limitations']='No priority inferred from security severity or text. Project and priority-label values are honored. Non-closing references to issues outside assigned scan can remain unknown. Unknown never means Low. Ranking does not grant assignment or override review, runtime, repository locks, or stop markers.'
