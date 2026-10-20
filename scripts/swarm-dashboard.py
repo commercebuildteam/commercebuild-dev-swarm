@@ -32,7 +32,8 @@ import datetime as _dt
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-STATE = Path.home() / '.agents/state/commercebuild-opencode-swarm'
+STATE = Path(os.environ.get('COMMERCEBUILD_SWARM_STATE',
+                            str(Path.home() / '.agents/state/commercebuild-opencode-swarm')))
 CONFIG = STATE / 'dashboard-config.json'
 CACHE = STATE / 'dashboard-jira-cache.json'
 REFRESH_LOCK = threading.Lock()

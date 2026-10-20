@@ -22,7 +22,9 @@ import priority_schedule
 import promotion_source
 import review_intake
 
-STATE = Path.home() / '.agents/state/commercebuild-opencode-swarm'
+STATE = Path(os.environ.get('COMMERCEBUILD_SWARM_STATE',
+                            str(Path.home() / '.agents/state/commercebuild-opencode-swarm')))
+LEGACY_STATE = Path.home() / '.agents/state/commercebuild-opencode-swarm'
 # Mutual-exclusion markers for the other two swarms:
 CLAUDE_RUNTIME = Path.home() / '.agents/state/commercebuild-claude-swarm/runtime.json'
 CODEX_REGISTRATION = Path.home() / '.agents/state/commercebuild-swarm/thread-id'
@@ -444,6 +446,21 @@ def session_check(session):
 
 def other_swarm_active():
     """Return True if any other commercebuild swarm coordinator is running."""
+    if STATE != LEGACY_STATE:
+        legacy = read(LEGACY_STATE / 'runtime.json')
+        if legacy.get('status') == 'running' and launcher_alive(legacy.get('launcher_pid')):
+            return True
+        for label in ('com.commercebuild.woo-reviewer-swarm',
+                      'com.commercebuild.woo-reviewer',
+                      'com.commercebuild.woo-reviewer-express',
+                      'com.commercebuild.woo-reviewer-donavon'):
+            try:
+                result = subprocess.run(['launchctl', 'print', f'gui/{os.getuid()}/{label}'],
+                                        capture_output=True, timeout=5)
+            except (OSError, subprocess.SubprocessError):
+                return True  # Unknown ownership is not safe to dispatch over.
+            if result.returncode == 0:
+                return True
     claude = read(CLAUDE_RUNTIME)
     command = pid_command(claude.get('launcher_pid'))
     if claude.get('status') == 'running' and ('swarm' in command or 'claude' in command):
@@ -583,7 +600,7 @@ def release_claim(session, claim_id, reason):
         return entry
 
 
-def preflight():
+def preflight(review_only=False):
     if other_swarm_active():
         raise RuntimeError(
             'Another commercebuild swarm is active (Claude or Codex). '
@@ -605,7 +622,9 @@ def preflight():
     if gh_json('api', 'user').get('login') != 'commercebuild':
         raise RuntimeError('GitHub account must be commercebuild; no automatic account switching')
     config_dir = Path.home() / '.config/opencode/agents'
-    for role_file in (f'{COORDINATOR_AGENT}.md', f'{DEVELOPER_AGENT}.md', f'{REVIEWER_AGENT}.md'):
+    roles = (REVIEWER_AGENT,) if review_only else (COORDINATOR_AGENT, DEVELOPER_AGENT, REVIEWER_AGENT)
+    for role in roles:
+        role_file = f'{role}.md'
         candidates = [config_dir / role_file,
                       Path(__file__).resolve().parent.parent / 'agents' / role_file]
         if not any(c.is_file() for c in candidates):
@@ -647,7 +666,7 @@ def terminate_all_workers():
         terminate_process_group(popen)
 
 
-def reap_orphan_workers():
+def reap_orphan_workers(tracked_only=False):
     """Kill worker processes left behind by a launcher that died without cleanup.
     Their queue entries are requeued, so a survivor would duplicate the work."""
     seen = set()
@@ -659,19 +678,20 @@ def reap_orphan_workers():
             terminate_process_group(pid)
             seen.add(pid)
     # Only the exact worker invocation, never a shell or grep that mentions it.
-    worker_cmd = re.compile(r'^(\S*/)?opencode run --standalone .*--title swarm-worker: w-')
-    try:
-        result = subprocess.run(['ps', '-axo', 'pid=,command='], capture_output=True,
-                                text=True, timeout=10)
-        for line in result.stdout.splitlines():
-            parts = line.strip().split(None, 1)
-            if len(parts) == 2 and worker_cmd.match(parts[1]):
-                pid = int(parts[0])
-                if pid not in seen and pid != os.getpid():
-                    log(f'killing untracked orphaned worker process pid {pid}')
-                    terminate_process_group(pid)
-    except (subprocess.SubprocessError, OSError, ValueError):
-        pass
+    if not tracked_only:
+        try:
+            result = subprocess.run(['ps', '-axo', 'pid=,command='], capture_output=True,
+                                    text=True, timeout=10)
+            worker_cmd = re.compile(r'^(\S*/)?opencode run --standalone .*--title swarm-worker: w-')
+            for line in result.stdout.splitlines():
+                parts = line.strip().split(None, 1)
+                if len(parts) == 2 and worker_cmd.match(parts[1]):
+                    pid = int(parts[0])
+                    if pid not in seen and pid != os.getpid():
+                        log(f'killing untracked orphaned worker process pid {pid}')
+                        terminate_process_group(pid)
+        except (subprocess.SubprocessError, OSError, ValueError):
+            pass
     with RUNTIME_MUTEX:
         current = read(STATE / 'runtime.json')
         current['active_workers'] = {}
@@ -714,7 +734,7 @@ def run_cadence(stop, interval, tasks, status_name, immediate=False):
         deadline = max(deadline + interval, time.monotonic() + min(1, interval))
 
 
-def promotion_intake_loop(stop, interval=60):
+def promotion_intake_loop(stop, interval=60, immediate=False):
     """Dedicated 60-second promotion discovery and durable queue insertion.
 
     Promotion discovery runs on its own thread so ticket-priority and review-intake
@@ -725,7 +745,7 @@ def promotion_intake_loop(stop, interval=60):
     run_cadence(stop, interval,
                 (('promotions', lambda: promotion_source.collect(STATE)),
                  ('queue_intake', lambda: record_high_tier(None))),
-                'promotion-intake-status.json')
+                'promotion-intake-status.json', immediate=immediate)
 
 
 def freshness_loop(stop, interval=60):
@@ -735,12 +755,12 @@ def freshness_loop(stop, interval=60):
                 'freshness-status.json', immediate=True)
 
 
-def review_intake_loop(stop, interval=60):
+def review_intake_loop(stop, interval=60, immediate=True):
     """Review discovery and queue insertion never wait for ticket priority."""
     run_cadence(stop, interval,
                 (('review_intake', lambda: review_intake.refresh(STATE)),
                  ('queue_intake', lambda: record_high_tier(None))),
-                'review-intake-status.json', immediate=True)
+                'review-intake-status.json', immediate=immediate)
 
 
 BLOCKED_RE = re.compile(
@@ -1363,6 +1383,9 @@ def prepare_entry(session, entry, quiet=False):
 
 def run_entry(args, model, session, item):
     entry, claim_id, prompt = item
+    if getattr(args, 'review_only', False) and entry.get('kind') != 'review':
+        release_claim(session, claim_id, 'review-only launcher rejected developer entry')
+        raise RuntimeError('Review-only launcher rejected developer entry')
     worker_id = entry['worker_id']
     if (entry.get('repo') or '').lower() in archived_repos():
         log(f'[dispatch] {worker_id}: skipped (archived repository)')
@@ -1489,8 +1512,9 @@ def run_entry(args, model, session, item):
 def dispatch_round(args, model, session):
     """Keep up to SLOTS workers live, refill a slot as soon as it frees, and end the
     round only when nothing is running, nothing is pending, and intake found nothing."""
-    priority_schedule.refresh(STATE, background=False)
-    promotion_source.collect(STATE)
+    if not getattr(args, 'review_only', False):
+        priority_schedule.refresh(STATE, background=False)
+        promotion_source.collect(STATE)
     # run_round owns the independent review-intake loop for this launcher.
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=SLOTS)
     futures = {}
@@ -1507,6 +1531,9 @@ def dispatch_round(args, model, session):
         return STOPPING.is_set() or (STATE / 'stop-dispatch').exists() or (STATE / 'stop-polling').exists()
 
     def run_backfill(slots):
+        if getattr(args, 'review_only', False):
+            backfill['found'] = 0
+            return
         try:
             backfill['found'] = len(direct_intake(session, limit=slots, assignee=args.assignee))
             backfill['failures'] = 0
@@ -1523,7 +1550,8 @@ def dispatch_round(args, model, session):
             active = sum(1 for f in futures if not f.done())
             if not stop_requested():
                 pending = [e for e in read_queue()
-                           if e.get('state') == 'pending' and entry_key(e) not in known]
+                           if e.get('state') == 'pending' and entry_key(e) not in known
+                           and (not getattr(args, 'review_only', False) or e.get('kind') == 'review')]
                 pending = priority_schedule.order(pending, STATE)
                 waiting = 0
                 # Donavon-requested reviews: intake is independent of capacity (all
@@ -1564,7 +1592,9 @@ def dispatch_round(args, model, session):
                 idle = not futures
                 free = SLOTS - active - waiting
                 due = time.monotonic() - backfill['at'] >= (BACKFILL_INTERVAL * min(backfill['failures'] + 1, 10))
-                if free > 0 and (thread is None or not thread.is_alive()) and (due or (idle and backfill['found'] is None)):
+                if not getattr(args, 'review_only', False) and free > 0 \
+                        and (thread is None or not thread.is_alive()) \
+                        and (due or (idle and backfill['found'] is None)):
                     backfill['at'] = time.monotonic()
                     thread = threading.Thread(target=run_backfill, args=(free,), daemon=True)
                     backfill['thread'] = thread
@@ -1586,6 +1616,7 @@ def dispatch_round(args, model, session):
                 thread.join(timeout=5)
                 continue
             still_pending = any(e.get('state') == 'pending' and entry_key(e) not in known
+                                and (not getattr(args, 'review_only', False) or e.get('kind') == 'review')
                                 for e in read_queue())
             if stop_requested() or (not still_pending and not backfill['found']):
                 break
@@ -2491,7 +2522,7 @@ def standalone_session_maintenance(args, reason, *, reap=False):
     if getattr(args, 'shared_server_url', None) or getattr(args, 'shared_server_transport', None) is not None:
         return
     if reap:
-        reap_orphan_workers()
+        reap_orphan_workers(tracked_only=getattr(args, 'review_only', False))
     release_stale_sessions(reason)
 
 
@@ -2503,7 +2534,7 @@ def run(args, final_status='stopped'):
             raise ValueError('Owned server requires an explicit port from1024to65535')
         if getattr(args, 'coordinator', False):
             raise ValueError('Owned server requires deterministic intake')
-        preflight()  # Refuse competing launcher before starting any child server.
+        preflight(getattr(args, 'review_only', False))  # Refuse competing launcher before starting any child server.
         from owned_server import OwnedServer
         factory = lambda: OwnedServer(
             ['opencode', 'serve', '--hostname', '127.0.0.1', '--port', str(port)],
@@ -2543,8 +2574,14 @@ def run(args, final_status='stopped'):
 
 def run_round(args, final_status='stopped'):
     apply_slots(args)
-    with lock(STATE / 'coordinator.lock', nonblocking=True):
-        preflight()
+    review_only = getattr(args, 'review_only', False)
+    with contextlib.ExitStack() as ownership:
+        # The original launcher uses this lock, so neither start order can run
+        # both services against the same repositories.
+        if review_only and STATE != LEGACY_STATE:
+            ownership.enter_context(lock(LEGACY_STATE / 'coordinator.lock', nonblocking=True))
+        ownership.enter_context(lock(STATE / 'coordinator.lock', nonblocking=True))
+        preflight(review_only)
         compact_queue()
         session = str(uuid.uuid4())
         if args.command == 'run':
@@ -2560,28 +2597,44 @@ def run_round(args, final_status='stopped'):
                    {'session_id': session, 'launcher_pid': os.getpid(),
                     'started_at': stamp(), 'heartbeat_at': stamp(), 'status': 'running',
                     'interval_seconds': 60, 'assignee': args.assignee, 'slots': SLOTS,
-                    'model': model or 'session default', 'active_workers': unresolved_session_runtime(read(STATE / 'runtime.json'))})
-        initial = poll()
-        if not initial['ok']:
-            log(f'discovery poll failed ({initial["errors"]}); continuing with direct intake')
+                    'model': model or 'session default', 'mode': 'review-only' if review_only else 'mixed',
+                    'active_workers': unresolved_session_runtime(read(STATE / 'runtime.json'))})
+        if not review_only:
+            initial = poll()
+            if not initial['ok']:
+                log(f'discovery poll failed ({initial["errors"]}); continuing with direct intake')
 
         # Recovery preserves persistent quarantines across launcher restart.
         update_queue(recover_queue_entries)
 
         stop = threading.Event()
-        watcher = threading.Thread(target=poll_loop, args=(stop,), daemon=True)
-        watcher.start()
+        watcher = None
+        if not review_only:
+            watcher = threading.Thread(target=poll_loop, args=(stop,), daemon=True)
+            watcher.start()
         # Promotion and ticket-priority discovery must not depend on dispatch cadence.
         freshness = threading.Thread(target=freshness_loop, args=(stop,), daemon=True,
                                      name='freshness-poller')
         freshness.start()
-        reviews = threading.Thread(target=review_intake_loop, args=(stop,), daemon=True,
+        reviews = threading.Thread(target=review_intake_loop, args=(stop, 60, True), daemon=True,
                                    name='review-intake')
         reviews.start()
-        promotions = threading.Thread(target=promotion_intake_loop, args=(stop,),
+        promotions = threading.Thread(target=promotion_intake_loop, args=(stop, 60, review_only),
                                       daemon=True, name='promotion-intake')
         promotions.start()
         try:
+            if review_only:
+                # The installed service has no developer intake or coordinator path.
+                # Pollers keep their 60-second cadence even when a review runs long.
+                while not STOPPING.is_set() and not (STATE / 'stop-dispatch').exists() \
+                        and not (STATE / 'stop-polling').exists():
+                    pending_reviews = [e for e in read_queue() if e.get('state') == 'pending'
+                                       and e.get('kind') == 'review']
+                    if pending_reviews:
+                        dispatch_round(args, model, session)
+                    else:
+                        stop.wait(1)
+                return 0
             # GitHub assignment discovery is deterministic and should not wait for
             # an LLM coordinator. Use the assignee's open issues and PRs first.
             def queued():
@@ -2605,7 +2658,8 @@ def run_round(args, final_status='stopped'):
             return run_llm_coordinator(args, model, session)
         finally:
             stop.set()
-            watcher.join(timeout=30)
+            if watcher:
+                watcher.join(timeout=30)
             freshness.join()
             reviews.join()
             promotions.join()
@@ -2813,7 +2867,7 @@ def main():
     sub = parser.add_subparsers(dest='command', required=True)
     for name in ('status', 'poll', 'refresh', 'backlog', 'preflight', 'watchdog', 'reconcile_receipts'):
         sub.add_parser(name)
-    for name in ('run', 'loop'):
+    for name in ('run', 'loop', 'review-loop'):
         p = sub.add_parser(name)
         p.add_argument('--cwd',
                        default=str(Path.home() / '.agents/state/commercebuild-opencode-swarm/workspace'),
@@ -2838,7 +2892,8 @@ def main():
                        help='When direct intake finds nothing, run the LLM coordinator for assessment-driven intake')
         p.add_argument('--coordinator-cap', type=int, default=900,
                        help='Seconds the LLM coordinator may run before the launcher takes over its plan')
-        if name == 'loop':
+        p.set_defaults(review_only=name == 'review-loop')
+        if name in ('loop', 'review-loop'):
             p.add_argument('--interval', type=int, default=60,
                            help='Seconds to wait between rounds when there is nothing to dispatch')
             p.add_argument('--max-rounds', type=int, default=0,
@@ -2862,7 +2917,7 @@ def main():
     try:
         if args.command == 'run':
             return run(args)
-        if args.command == 'loop':
+        if args.command in ('loop', 'review-loop'):
             return run_forever(args)
         if args.command == 'preflight':
             preflight()
