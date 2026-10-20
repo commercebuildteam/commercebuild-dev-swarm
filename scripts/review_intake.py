@@ -1,12 +1,10 @@
 """Read-only review discovery. Durable local queue; never launches reviewers or writes GitHub."""
-import datetime, fcntl, html, json, os, pathlib, re, subprocess, tempfile, threading, time
+import concurrent.futures, datetime, fcntl, html, json, os, pathlib, re, subprocess, tempfile, threading, time
 DONAVON='donavon-commercebuild'
 TARGETS={'bhalecb','commercebuild'}
 # A bare mention of bhalecb is never sufficient: the comment must contain an
 # explicit review request addressed to him, from donavon-commercebuild himself.
 EXPLICIT_REQUEST=re.compile(r'(?i)\b(?:please\s+|kindly\s+|can\s+you\s+|could\s+you\s+|request(?:ing|ed)?\s+(?:a\s+)?)review\b')
-COMMENT_SCAN_BUDGET=25
-ISSUE_SCAN_BUDGET=25
 DISCOVERY_SECONDS=40
 # Linked issues beyond the closing references: full URLs and bare #N references
 # in the PR body are also explicit links whose comments must be scanned.
@@ -114,6 +112,49 @@ def can_dispatch(issue,donavon_urls,running_reviews):
  queued and visible, but at most MAX_CONCURRENT_REVIEWS run concurrently within the
  total worker cap and one worker per repository."""
  return not (issue in donavon_urls and running_reviews>=MAX_CONCURRENT_REVIEWS)
+def inspect_candidate(n,deadline,priorities,old_items):
+ """Inspect one PR without mutating the snapshot; callers retain completed work."""
+ errors=[];comment_evidence=[];linked_issue_priorities=[];failed=False
+ try:comment_evidence=explicit_comment_requests(comments_for(n['url'],deadline))
+ except (RuntimeError,subprocess.TimeoutExpired,ValueError) as e:
+  errors.append(str(e) if isinstance(e,RuntimeError) else type(e).__name__);failed=True
+ for issue_url in linked_issue_urls(n):
+  if time.monotonic()>=deadline:
+   errors.append('linked issue scan deadline');failed=True;break
+  try:comment_evidence.extend(explicit_comment_requests(comments_for(issue_url,deadline)))
+  except (RuntimeError,subprocess.TimeoutExpired,ValueError) as e:
+   errors.append(str(e) if isinstance(e,RuntimeError) else type(e).__name__);failed=True
+  try:priority=issue_priority(issue_url,deadline)
+  except (RuntimeError,subprocess.TimeoutExpired,ValueError) as e:
+   errors.append(str(e) if isinstance(e,RuntimeError) else type(e).__name__);priority=None;failed=True
+  if priority:linked_issue_priorities.append(priority)
+ item=classify(n,comment_evidence)
+ ranks={'Urgent':1,'High':2,'Medium':3,'Low':4}
+ if item:
+  native=[priorities.get(item['url'])]+linked_issue_priorities
+  best=min([p for p in native if p],key=lambda p:ranks.get(p,9),default=None)
+  if ranks.get(best,9)<ranks.get(item['priority'],9):
+   item['priority']=best;item['priority_reason']='Linked issue priority'
+  if failed and n['url'] in old_items:
+   previous=old_items[n['url']]
+   if ranks.get(previous.get('priority'),9)<ranks.get(item.get('priority'),9):
+    item['priority']=previous['priority'];item['priority_reason']='Last known priority; linked issue lookup failed'
+ elif failed:item=old_items.get(n['url'])
+ return item,errors
+
+def search_candidates(term,deadline):
+ nodes=[];truncated=False;error=None
+ search='org:commercebuildteam is:pr is:open '+term;cursor=None
+ for page in range(3):
+  after=',after:'+json.dumps(cursor) if cursor else ''
+  try:
+   data=query('{search(query:'+json.dumps(search)+',type:ISSUE,first:100'+after+'){pageInfo{hasNextPage endCursor} nodes{'+FRAGMENT+'}}}',deadline)
+   nodes.extend(data['nodes']);truncated=data['pageInfo']['hasNextPage']
+   if not truncated:break
+   cursor=data['pageInfo']['endCursor']
+  except (RuntimeError,subprocess.TimeoutExpired,ValueError,KeyError) as e:
+   error=str(e);break
+ return nodes,truncated,error
 def refresh(state):
  state.mkdir(parents=True,exist_ok=True);path=state/'review-intake.json'
  previous=snapshot(state)
@@ -141,66 +182,73 @@ def refresh(state):
   except (OSError,ValueError):old={}
   result={'checked_at':now,'interval_seconds':60,'max_concurrent_reviews':2,'execution_enabled':True,'items':[],'errors':[],'truncated':{}}
   deadline=time.monotonic()+DISCOVERY_SECONDS
+  try:priorities={i['url']:i.get('priority') for i in json.loads((state/'priority-snapshot.json').read_text())['items']}
+  except (OSError,ValueError,KeyError):priorities={}
+  old_items={i.get('url'):i for i in old.get('items',[]) if isinstance(i,dict) and i.get('url')}
+  previous_deferred=set(old.get('deferred_urls') or [])
+  ranks={'Urgent':1,'High':2,'Medium':3,'Low':4}
+  items={};seen=set();pending={};deferred=[]
+  searches=['commenter:'+DONAVON,'review-requested:bhalecb','review-requested:commercebuild',
+            'assignee:bhalecb','assignee:commercebuild','author:'+DONAVON]
+  search_pool=concurrent.futures.ThreadPoolExecutor(max_workers=len(searches))
+  detail_pool=concurrent.futures.ThreadPoolExecutor(max_workers=16)
+  def collect_search(future):
+   term=search_jobs[future]
+   try:
+    response=future.result()
+    nodes,truncated=response[:2]
+    error=response[2] if len(response)>2 else None
+   except (RuntimeError,subprocess.TimeoutExpired,ValueError,KeyError) as e:
+    result['errors'].append(f'{term}: {e}');return
+   result['truncated'][term]=truncated
+   if error:result['errors'].append(f'{term}: {error}')
+   if truncated and not error:result['errors'].append(f'{term}: search page cap reached')
+   for n in sorted(nodes,key=lambda row:row.get('url') not in previous_deferred):
+    url=n.get('url')
+    if not url or url in seen:continue
+    seen.add(url)
+    pending[detail_pool.submit(inspect_candidate,n,deadline,priorities,old_items)]=n
   try:
-   nodes={}
-   for term in ['review-requested:bhalecb','review-requested:commercebuild','assignee:bhalecb','assignee:commercebuild','author:'+DONAVON,'commenter:'+DONAVON]:
-    search='org:commercebuildteam is:pr is:open '+term;cursor=None
-    for page in range(3):
-     after=',after:'+json.dumps(cursor) if cursor else ''
-     data=query('{search(query:'+json.dumps(search)+',type:ISSUE,first:100'+after+'){pageInfo{hasNextPage endCursor} nodes{'+FRAGMENT+'}}}',deadline)
-     nodes.update({n['url']:n for n in data['nodes']});result['truncated'][term]=data['pageInfo']['hasNextPage']
-     if not data['pageInfo']['hasNextPage']:break
-     cursor=data['pageInfo']['endCursor']
-   # Inherit known native issue priority; Donavon is a floor, never a downgrade of Urgent.
-   try:priorities={i['url']:i.get('priority') for i in json.loads((state/'priority-snapshot.json').read_text())['items']}
-   except (OSError,ValueError,KeyError):priorities={}
-   old_items={i.get('url'):i for i in old.get('items',[]) if isinstance(i,dict) and i.get('url')}
-   ranks={'Urgent':1,'High':2,'Medium':3,'Low':4}
-   budget=COMMENT_SCAN_BUDGET;issue_budget=ISSUE_SCAN_BUDGET
-   for n in nodes.values():
-    if time.monotonic()>=deadline:raise subprocess.TimeoutExpired('gh review scan',0)
-    item_failed=False
-    comment_evidence=[]
-    if budget>0:
-     budget-=1
-     try:comment_evidence=explicit_comment_requests(comments_for(n['url'],deadline))
-     except (RuntimeError,subprocess.TimeoutExpired,ValueError) as ce:
-      result['errors'].append(str(ce) if isinstance(ce,RuntimeError) else type(ce).__name__);item_failed=True
-    # Explicit requests can live in verified linked issues, not only PR comments.
-    # Closing references and explicit body links (including non-closing issues)
-    # are both required sources, and each linked issue also carries its own
-    # current ticket priority.
-    linked_issue_priorities=[]
-    for issue_url in linked_issue_urls(n):
-     if time.monotonic()>=deadline:raise subprocess.TimeoutExpired('gh review scan',0)
-     if issue_budget<=0:break
-     issue_budget-=1
-     try:comment_evidence.extend(explicit_comment_requests(comments_for(issue_url,deadline)))
-     except (RuntimeError,subprocess.TimeoutExpired,ValueError) as ce:
-      result['errors'].append(str(ce) if isinstance(ce,RuntimeError) else type(ce).__name__);item_failed=True
-     try:
-      priority=issue_priority(issue_url,deadline)
-     except (RuntimeError,subprocess.TimeoutExpired,ValueError) as pe:
-      result['errors'].append(str(pe) if isinstance(pe,RuntimeError) else type(pe).__name__);priority=None;item_failed=True
-     if priority:linked_issue_priorities.append(priority)
-    item=classify(n,comment_evidence)
-    if item:
-     native=[priorities.get(item['url'])]+linked_issue_priorities
-     best=min([p for p in native if p],key=lambda p:ranks.get(p,9),default=None)
-     if ranks.get(best,9)<ranks.get(item['priority'],9):item['priority']=best;item['priority_reason']='Linked issue priority'
-     if item_failed and n['url'] in old_items:
-      previous=old_items[n['url']]
-      if ranks.get(previous.get('priority'),9)<ranks.get(item.get('priority'),9):
-       item['priority']=previous['priority'];item['priority_reason']='Last known priority; linked issue lookup failed'
-     result['items'].append(item)
-    elif item_failed and n['url'] in old_items:
-     result['items'].append(old_items[n['url']])
-   result['items'].sort(key=lambda i:(ranks.get(i['priority'],9),i['updated_at'],i['url']))
-   if result['errors']:
-    result['partial']=True;result['last_success_at']=old.get('last_success_at')
-   else:result['last_success_at']=now
-  except (RuntimeError,subprocess.TimeoutExpired,ValueError,KeyError) as e:
-   result['errors']=[str(e) if isinstance(e,RuntimeError) else type(e).__name__];result['items']=old.get('items',[]);result['last_success_at']=old.get('last_success_at')
+   search_jobs={search_pool.submit(search_candidates,term,deadline):term for term in searches}
+   for future in concurrent.futures.as_completed(search_jobs,timeout=max(0,deadline-time.monotonic())):
+    collect_search(future)
+    search_jobs.pop(future)
+  except concurrent.futures.TimeoutError:
+   result['errors'].append('review search deadline reached')
+  finally:
+   for future in list(search_jobs):
+    if future.done():collect_search(future)
+   search_pool.shutdown(wait=False,cancel_futures=True)
+  # Gather every finished inspection, including those completed while another
+  # search timed out. Remaining candidates are explicit deferred work.
+  try:
+   for future in concurrent.futures.as_completed(pending,timeout=max(0,deadline-time.monotonic())):
+    n=pending.pop(future)
+    try:item,errors=future.result()
+    except (RuntimeError,subprocess.TimeoutExpired,ValueError,KeyError) as e:
+     item=old_items.get(n['url']);errors=[str(e)]
+    result['errors'].extend(errors)
+    if item:items[n['url']]=item
+  except concurrent.futures.TimeoutError:
+   pass
+  finally:
+   for future,n in list(pending.items()):
+    if future.done():
+     pending.pop(future)
+     try:item,errors=future.result()
+     except (RuntimeError,subprocess.TimeoutExpired,ValueError,KeyError) as e:
+      item=old_items.get(n['url']);errors=[str(e)]
+     result['errors'].extend(errors)
+     if item:items[n['url']]=item
+    else:deferred.append(n['url'])
+   detail_pool.shutdown(wait=False,cancel_futures=True)
+  if deferred:result['errors'].append(f'{len(deferred)} candidate inspections deferred by deadline')
+  result['deferred_urls']=deferred
+  if result['errors']:
+   items.update({url:item for url,item in old_items.items() if url not in items})
+   result['partial']=True;result['last_success_at']=old.get('last_success_at')
+  else:result['last_success_at']=now
+  result['items']=sorted(items.values(),key=lambda i:(ranks.get(i.get('priority'),9),i.get('updated_at') or '',i['url']))
   atomic(path,result)
   return result
 _POLLING=False

@@ -188,7 +188,8 @@ def compact_queue():
         for entry in entries:
             if entry.get('kind') == 'review' and entry.get('state') in REVIEW_HANDLED_STATES \
                     and entry.get('review_signature'):
-                handled[entry['issue']] = entry['review_signature']
+                handled[entry['issue']] = {'signature': entry['review_signature'],
+                                           'completed_at': entry.get('updated_at')}
         atomic(handled_path, handled)
         terminal = sorted((i for i, entry in enumerate(entries)
                            if entry.get('state') in TERMINAL_STATES),
@@ -2036,6 +2037,39 @@ def review_signature(item):
     }, sort_keys=True)
 
 
+def settled_review_covers(signature, receipt, completed_at=None):
+    """A request discovered after completion is old if it predates that review.
+
+    Preserve head and gate changes, and require a timestamp for every newly
+    discovered request. Missing timestamps remain actionable.
+    """
+    if isinstance(receipt, dict):
+        completed_at = receipt.get('completed_at')
+        receipt = receipt.get('signature')
+    if receipt == signature:
+        return True
+    finished = parse_ts(completed_at)
+    if not receipt or not finished:
+        return False
+    try:
+        old, current = json.loads(receipt), json.loads(signature)
+    except (TypeError, ValueError):
+        return False
+    if old.get('head') != current.get('head') or old.get('gate') != current.get('gate'):
+        return False
+    prior_requests = {tuple(request) for request in old.get('requests', [])}
+    current_requests = {tuple(request) for request in current.get('requests', [])}
+    if not prior_requests.issubset(current_requests):
+        return False
+    for request in current_requests - prior_requests:
+        if len(request) != 3:
+            return False
+        created = parse_ts(request[2])
+        if not created or created > finished:
+            return False
+    return True
+
+
 def issue_requires_reassessment(item):
     """A linked PR is not evidence that newer issue instructions are satisfied."""
     cp = read(STATE / 'checkpoints' / (worker_id_for(item['url']) + '.json'))
@@ -2069,7 +2103,7 @@ def record_high_tier(session):
         if e.get('state') in ('pending', 'running'):
             live_urls.add(url)
         elif url and e.get('state') in REVIEW_HANDLED_STATES:
-            terminal[url] = e.get('review_signature')
+            terminal[url] = e
     handled = read(STATE / 'dispatch' / 'handled-reviews.json')
     candidates = {i['url']: i for i in review_intake.snapshot(STATE).get('items', [])
                   if i.get('donavon_request') and i.get('url')}
@@ -2093,7 +2127,11 @@ def record_high_tier(session):
         if not url or url in live_urls:
             continue
         signature = review_signature(item)
-        if terminal.get(url) == signature or handled.get(url) == signature:
+        receipt = terminal.get(url)
+        if receipt and settled_review_covers(signature, receipt.get('review_signature'),
+                                             receipt.get('updated_at')):
+            continue
+        if settled_review_covers(signature, handled.get(url)):
             continue
         repo = '/'.join(url.split('/')[3:5]).lower()
         worker_id = worker_id_for(url)
@@ -2114,8 +2152,9 @@ def record_high_tier(session):
                    and e.get('state') in ('pending', 'running') for e in entries):
                 return None
             if any(e.get('worker_id') == worker_id
-                   and e.get('review_signature') == signature
-                   and e.get('state') in REVIEW_HANDLED_STATES for e in entries):
+                   and e.get('state') in REVIEW_HANDLED_STATES
+                   and settled_review_covers(signature, e.get('review_signature'),
+                                             e.get('updated_at')) for e in entries):
                 return None
             kept = [e for e in entries if e.get('worker_id') != worker_id]
             return [{'worker_id': worker_id, 'repo': repo, 'issue': url, 'claim_id': '',

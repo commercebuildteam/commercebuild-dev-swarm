@@ -1405,6 +1405,53 @@ class ReviewerRoutingAndCapacity(unittest.TestCase):
         request('2')
         self.assertEqual(len(module.record_high_tier('session-x')), 1)
 
+    def test_delayed_request_evidence_does_not_repeat_completed_promotion_review(self):
+        module = self._module()
+        module.QUEUE_PATH = self.state / 'dispatch' / 'queue.json'
+        module.archived_repos = lambda: set()
+        promo = promotion_node()['url']
+        (self.state / 'promotion-snapshot.json').write_text(json.dumps({'items': [
+            {'url': promo, 'kind': 'promotion', 'next_owner': 'bhalecb',
+             'branch_evidence': {'sha': 'a' * 40}}]}))
+        request = {'url': promo, 'donavon_request': True, 'head': 'a' * 40,
+                   'request_evidence': [{'kind': 'comment', 'id': '1',
+                                         'created_at': '2020-01-01T00:00:00Z'}]}
+
+        for discovered_before_review in (False, True):
+            module.QUEUE_PATH = self.state / 'dispatch' / (
+                'queue-first.json' if discovered_before_review else 'queue-late.json')
+            (self.state / 'dispatch' / 'handled-reviews.json').unlink(missing_ok=True)
+            (self.state / 'review-intake.json').write_text(json.dumps({
+                'items': [request] if discovered_before_review else []}))
+            recorded = module.record_high_tier('session-x')
+            self.assertEqual(len(recorded), 1)
+            module.set_queue_state(recorded[0]['worker_id'], state='completed')
+            (self.state / 'review-intake.json').write_text(json.dumps({'items': [request]}))
+            self.assertEqual(module.record_high_tier('session-x'), [])
+            self.assertEqual(module.read_queue()[0]['state'], 'completed')
+            # Compaction must preserve the completion time for the same decision.
+            module.compact_queue()
+            self.assertEqual(module.record_high_tier('session-x'), [])
+
+    def test_request_after_completed_promotion_review_requeues(self):
+        module = self._module()
+        module.QUEUE_PATH = self.state / 'dispatch' / 'queue.json'
+        module.archived_repos = lambda: set()
+        promo = promotion_node()['url']
+        (self.state / 'promotion-snapshot.json').write_text(json.dumps({'items': [
+            {'url': promo, 'kind': 'promotion', 'next_owner': 'bhalecb',
+             'branch_evidence': {'sha': 'a' * 40}}]}))
+        (self.state / 'review-intake.json').write_text(json.dumps({'items': []}))
+        recorded = module.record_high_tier('session-x')
+        module.set_queue_state(recorded[0]['worker_id'], state='completed')
+        later = (datetime.datetime.now(datetime.timezone.utc)
+                 + datetime.timedelta(minutes=1)).isoformat()
+        (self.state / 'review-intake.json').write_text(json.dumps({'items': [
+            {'url': promo, 'donavon_request': True, 'head': 'a' * 40,
+             'request_evidence': [{'kind': 'comment', 'id': '2',
+                                   'created_at': later}]}]}))
+        self.assertEqual(len(module.record_high_tier('session-x')), 1)
+
     def test_new_promotion_head_wins_over_stale_review_snapshot(self):
         module = self._module()
         module.QUEUE_PATH = self.state / 'dispatch' / 'queue.json'
@@ -1712,6 +1759,92 @@ class ReviewerRoutingAndCapacity(unittest.TestCase):
         self.assertFalse(thread.is_alive())
         self.assertEqual(result[0]['checked_at'], 'new')
         self.assertEqual(len(module.record_high_tier('session-x')), 1)
+
+    def test_cold_timeout_preserves_completed_request_for_queue(self):
+        module = self._module()
+        module.QUEUE_PATH = self.state / 'dispatch' / 'queue.json'
+        module.archived_repos = lambda: set()
+        found = dict(intake_node(actor='bhalecb'), body='',
+                     updatedAt='2026-10-15T11:00:00Z',
+                     closingIssuesReferences={'nodes': []})
+        delayed = dict(found, url='https://github.com/commercebuildteam/r/pull/8')
+
+        def search(term, deadline):
+            return ([found, delayed], False) if term.startswith('commenter:') else ([], False)
+
+        def comments(url, deadline=None):
+            if url == delayed['url']:
+                time.sleep(0.2)
+                raise subprocess.TimeoutExpired('gh', 0.1)
+            return [{'id': 1, 'user': 'donavon-commercebuild',
+                     'body': 'Please review @bhalecb',
+                     'created_at': '2026-10-15T10:00:00Z'}]
+
+        with mock.patch.object(review_intake, 'DISCOVERY_SECONDS', 0.1), \
+             mock.patch.object(review_intake, 'search_candidates', search), \
+             mock.patch.object(review_intake, 'comments_for', comments):
+            snapshot = review_intake.refresh(self.state)
+        self.assertTrue(snapshot['partial'])
+        self.assertIn(DONAVON_PR, {i['url'] for i in snapshot['items']})
+        self.assertEqual(len(module.record_high_tier('session-x')), 1)
+
+    def test_later_search_page_timeout_keeps_first_page_request(self):
+        module = self._module()
+        module.QUEUE_PATH = self.state / 'dispatch' / 'queue.json'
+        module.archived_repos = lambda: set()
+        found = dict(intake_node(actor='bhalecb'), body='',
+                     updatedAt='2026-10-15T11:00:00Z',
+                     closingIssuesReferences={'nodes': []})
+
+        def query(q, deadline=None):
+            if 'commenter:donavon-commercebuild' in q:
+                if 'after:' in q:
+                    raise subprocess.TimeoutExpired('gh graphql', 1)
+                return {'nodes': [found], 'pageInfo': {
+                    'hasNextPage': True, 'endCursor': 'next'}}
+            return {'nodes': [], 'pageInfo': {
+                'hasNextPage': False, 'endCursor': None}}
+
+        def comments(url, deadline=None):
+            return [{'id': 1, 'user': 'donavon-commercebuild',
+                     'body': 'Please review @bhalecb',
+                     'created_at': '2026-10-15T10:00:00Z'}]
+
+        with mock.patch.object(review_intake, 'query', query), \
+             mock.patch.object(review_intake, 'comments_for', comments):
+            snapshot = review_intake.refresh(self.state)
+        self.assertTrue(snapshot['partial'])
+        self.assertTrue(any('commenter:donavon-commercebuild' in error
+                            for error in snapshot['errors']))
+        self.assertIn(DONAVON_PR, {i['url'] for i in snapshot['items']})
+        self.assertEqual(len(module.record_high_tier('session-x')), 1)
+
+    def test_comment_request_after_old_budget_is_discovered(self):
+        module = self._module()
+        module.QUEUE_PATH = self.state / 'dispatch' / 'queue.json'
+        module.archived_repos = lambda: set()
+        base = dict(intake_node(actor='bhalecb'), body='',
+                    updatedAt='2026-10-15T11:00:00Z',
+                    closingIssuesReferences={'nodes': []})
+        nodes = [dict(base, url=f'https://github.com/commercebuildteam/r/pull/{n}')
+                 for n in range(1, 27)]
+        target = nodes[-1]['url']
+
+        def search(term, deadline):
+            return (nodes, False) if term.startswith('commenter:') else ([], False)
+
+        def comments(url, deadline=None):
+            return ([{'id': 26, 'user': 'donavon-commercebuild',
+                      'body': 'Please review @bhalecb',
+                      'created_at': '2026-10-15T10:00:00Z'}]
+                    if url == target else [])
+
+        with mock.patch.object(review_intake, 'search_candidates', search), \
+             mock.patch.object(review_intake, 'comments_for', comments):
+            snapshot = review_intake.refresh(self.state)
+        self.assertFalse(snapshot['errors'])
+        self.assertEqual([i['url'] for i in snapshot['items'] if i['donavon_request']], [target])
+        self.assertEqual(module.record_high_tier('session-x')[0]['url'], target)
 
     def test_linked_priority_http_error_is_visible(self):
         issue_url = 'https://github.com/commercebuildteam/r/issues/11'
