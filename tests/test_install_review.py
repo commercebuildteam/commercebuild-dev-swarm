@@ -1,6 +1,7 @@
 """Review-only installation and dispatch boundaries."""
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
@@ -34,6 +35,15 @@ class ReviewInstaller(unittest.TestCase):
         (self.repo / 'README.md').write_text('Runtime\n')
         self.module = load(ROOT / 'scripts/install_review.py', 'install_review_test')
 
+    def reviewed_tree(self):
+        entries = []
+        for name in ('README.md', 'scripts/swarm-opencode.py',
+                     'agents/commercebuild-swarm-reviewer.md'):
+            content = (self.repo / name).read_bytes()
+            entries.append({'path': name, 'type': 'blob', 'mode': '100644',
+                            'sha': hashlib.sha1(f'blob {len(content)}\0'.encode() + content).hexdigest()})
+        return json.dumps({'truncated': False, 'tree': entries})
+
     def test_install_stages_inactive_isolated_review_service(self):
         old = self.home / 'old-state'
         (old / 'dispatch').mkdir(parents=True)
@@ -41,6 +51,7 @@ class ReviewInstaller(unittest.TestCase):
         (old / 'dispatch/queue.json').write_text(json.dumps({'entries': [{'kind': 'developer'}]}))
         with mock.patch.object(self.module, 'command', side_effect=['', 'a' * 40]), \
                 mock.patch.object(self.module, 'require_reviewed_main_commit'), \
+                mock.patch.object(self.module, 'verify_staged_tree'), \
                 mock.patch.object(self.module, 'check_idle'):
             result = self.module.install(self.repo, self.home, 'openai/review-model', old)
         self.assertFalse(result['active'])
@@ -58,12 +69,14 @@ class ReviewInstaller(unittest.TestCase):
                          str(state / 'workspace'))
         self.assertTrue((state / 'workspace').is_dir())
         self.assertEqual(config['EnvironmentVariables']['COMMERCEBUILD_SWARM_STATE'], str(state))
+        self.assertEqual(config['EnvironmentVariables']['PYTHONDONTWRITEBYTECODE'], '1')
 
     def test_install_rejects_implicit_provider_and_active_service(self):
         with self.assertRaises(ValueError):
             self.module.install(self.repo, self.home, 'openrouter/model')
         with mock.patch.object(self.module, 'command', side_effect=['', 'b' * 40]), \
                 mock.patch.object(self.module, 'require_reviewed_main_commit'), \
+                mock.patch.object(self.module, 'verify_staged_tree'), \
                 mock.patch.object(self.module, 'loaded', return_value=True):
             with self.assertRaisesRegex(RuntimeError, 'review service is running'):
                 self.module.install(self.repo, self.home, 'openai/review-model')
@@ -79,6 +92,7 @@ class ReviewInstaller(unittest.TestCase):
         (old / 'runtime.json').write_text(json.dumps({'launcher_pid': os.getpid(), 'status': 'running'}))
         with mock.patch.object(self.module, 'command', side_effect=['', 'c' * 40]), \
                 mock.patch.object(self.module, 'require_reviewed_main_commit'), \
+                mock.patch.object(self.module, 'verify_staged_tree'), \
                 mock.patch.object(self.module, 'loaded', return_value=False):
             with self.assertRaisesRegex(RuntimeError, 'still running'):
                 self.module.install(self.repo, self.home, 'openai/review-model', old)
@@ -91,7 +105,8 @@ class ReviewInstaller(unittest.TestCase):
                 self.module.install(self.repo, self.home, 'openai/review-model')
         self.assertFalse(self.module.paths(self.home)[0].exists())
         with mock.patch.object(self.module, 'command', side_effect=['', sha]), \
-                mock.patch.object(self.module, 'require_reviewed_main_commit'):
+                mock.patch.object(self.module, 'require_reviewed_main_commit'), \
+                mock.patch.object(self.module, 'verify_staged_tree'):
             self.module.install(self.repo, self.home, 'openai/review-model')
         with mock.patch.object(self.module, 'command', return_value=json.dumps({'status': 'diverged'})), \
                 mock.patch.object(self.module, 'loaded', return_value=False), \
@@ -100,6 +115,96 @@ class ReviewInstaller(unittest.TestCase):
                 self.module.activate(self.home)
         launch.assert_not_called()
         self.assertFalse(self.module.live_plist(self.home).exists())
+
+    def test_modified_staged_files_cannot_install_or_activate(self):
+        sha = 'e' * 40
+        tree = self.reviewed_tree()
+        with mock.patch.object(self.module, 'command', side_effect=['', sha, tree]), \
+                mock.patch.object(self.module, 'require_reviewed_main_commit'):
+            self.module.install(self.repo, self.home, 'openai/review-model')
+        base, _, _ = self.module.paths(self.home)
+        version = base / 'versions' / sha
+        script = version / 'scripts/swarm-opencode.py'
+        script.write_text('print("changed")\n')
+        with mock.patch.object(self.module, 'command', return_value=tree), \
+                mock.patch.object(self.module, 'require_reviewed_main_commit'), \
+                mock.patch.object(self.module.subprocess, 'run') as launch:
+            with self.assertRaisesRegex(RuntimeError, 'Staged file differs'):
+                self.module.activate(self.home)
+        launch.assert_not_called()
+        self.assertFalse(self.module.live_plist(self.home).exists())
+
+        with mock.patch.object(self.module, 'command', side_effect=['', sha, tree]), \
+                mock.patch.object(self.module, 'require_reviewed_main_commit'):
+            with self.assertRaisesRegex(RuntimeError, 'Staged file differs'):
+                self.module.install(self.repo, self.home, 'openai/review-model')
+        script.write_bytes((self.repo / 'scripts/swarm-opencode.py').read_bytes())
+        role = version / 'agents/commercebuild-swarm-reviewer.md'
+        role.write_text('Developer access\n')
+        with mock.patch.object(self.module, 'command', return_value=tree), \
+                mock.patch.object(self.module, 'require_reviewed_main_commit'), \
+                mock.patch.object(self.module.subprocess, 'run') as launch:
+            with self.assertRaisesRegex(RuntimeError, 'Staged file differs'):
+                self.module.activate(self.home)
+        launch.assert_not_called()
+        role.write_bytes((self.repo / 'agents/commercebuild-swarm-reviewer.md').read_bytes())
+        (version / 'scripts/extra.py').write_text('print("extra")\n')
+        with mock.patch.object(self.module, 'command', return_value=tree), \
+                mock.patch.object(self.module, 'require_reviewed_main_commit'), \
+                mock.patch.object(self.module.subprocess, 'run') as launch:
+            with self.assertRaisesRegex(RuntimeError, 'Staged files differ'):
+                self.module.activate(self.home)
+        launch.assert_not_called()
+        (version / 'scripts/extra.py').unlink()
+        script.unlink()
+        script.symlink_to(self.repo / 'scripts/swarm-opencode.py')
+        with mock.patch.object(self.module, 'command', return_value=tree), \
+                mock.patch.object(self.module, 'require_reviewed_main_commit'), \
+                mock.patch.object(self.module.subprocess, 'run') as launch:
+            with self.assertRaisesRegex(RuntimeError, 'Staged file is a symlink'):
+                self.module.activate(self.home)
+        launch.assert_not_called()
+        script.unlink()
+        script.write_bytes((self.repo / 'scripts/swarm-opencode.py').read_bytes())
+        role.unlink()
+        with mock.patch.object(self.module, 'command', return_value=tree), \
+                mock.patch.object(self.module, 'require_reviewed_main_commit'), \
+                mock.patch.object(self.module.subprocess, 'run') as launch:
+            with self.assertRaisesRegex(RuntimeError, 'Staged files differ'):
+                self.module.activate(self.home)
+        launch.assert_not_called()
+        role.write_bytes((self.repo / 'agents/commercebuild-swarm-reviewer.md').read_bytes())
+        plist = self.module.paths(self.home)[2]
+        config = plistlib.loads(plist.read_bytes())
+        config['ProgramArguments'][1] = '/tmp/unreviewed-launcher.py'
+        plist.write_bytes(plistlib.dumps(config))
+        with mock.patch.object(self.module, 'command', return_value=tree), \
+                mock.patch.object(self.module, 'require_reviewed_main_commit'), \
+                mock.patch.object(self.module.subprocess, 'run') as launch:
+            with self.assertRaisesRegex(RuntimeError, 'staged review LaunchAgent has changed'):
+                self.module.activate(self.home)
+        launch.assert_not_called()
+        self.assertFalse(self.module.live_plist(self.home).exists())
+
+    def test_verified_staged_service_can_bootstrap(self):
+        sha = 'f' * 40
+        tree = self.reviewed_tree()
+        with mock.patch.object(self.module, 'command', side_effect=['', sha, tree]), \
+                mock.patch.object(self.module, 'require_reviewed_main_commit'):
+            self.module.install(self.repo, self.home, 'openai/review-model')
+
+        def command(*args):
+            return 'commercebuild' if args[-2:] == ('--jq', '.login') else tree
+
+        with mock.patch.object(self.module, 'command', side_effect=command), \
+                mock.patch.object(self.module, 'require_reviewed_main_commit'), \
+                mock.patch.object(self.module, 'check_idle'), \
+                mock.patch.object(self.module, 'loaded', return_value=False), \
+                mock.patch.object(self.module.shutil, 'which', return_value='/usr/bin/opencode'), \
+                mock.patch.object(self.module.subprocess, 'run') as launch:
+            self.module.activate(self.home)
+        self.assertEqual(launch.call_args.args[0][:2], ['launchctl', 'bootstrap'])
+        self.assertTrue(self.module.live_plist(self.home).exists())
 
     def test_main_commit_requires_exact_head_approval(self):
         sha, head = 'a' * 40, 'b' * 40

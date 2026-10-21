@@ -2,12 +2,14 @@
 """Install a versioned, inactive review-only launcher for macOS launchd."""
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
 import plistlib
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -128,6 +130,67 @@ def require_reviewed_main_commit(sha):
     raise RuntimeError('The staged commit has no merged main PR approved on its exact head')
 
 
+def verify_staged_tree(sha, version):
+    """Match every staged file to the reviewed commit's Git blobs."""
+    repo = 'commercebuildteam/commercebuild-dev-swarm'
+    tree = json.loads(command('gh', 'api', f'repos/{repo}/git/trees/{sha}?recursive=1'))
+    if tree.get('truncated') or not isinstance(tree.get('tree'), list):
+        raise RuntimeError('The reviewed Git tree is incomplete')
+    expected = {}
+    for entry in tree['tree']:
+        name = entry.get('path', '')
+        if name != 'README.md' and not name.startswith(('scripts/', 'agents/')):
+            continue
+        if entry.get('type') == 'tree':
+            continue
+        if (entry.get('type') != 'blob' or entry.get('mode') not in ('100644', '100755')
+                or not re.fullmatch(r'[0-9a-f]{40}', entry.get('sha', '')) or name in expected):
+            raise RuntimeError(f'Unsupported reviewed Git entry: {name}')
+        expected[name] = entry
+    required = {'README.md', 'scripts/swarm-opencode.py',
+                'agents/commercebuild-swarm-reviewer.md'}
+    if not required <= expected.keys():
+        raise RuntimeError('The reviewed Git tree is missing required review files')
+    actual = {}
+    for name in ('README.md', 'scripts', 'agents'):
+        root = version / name
+        if root.is_symlink():
+            raise RuntimeError(f'Staged file is a symlink: {root}')
+        for path in (root,) if name == 'README.md' else root.rglob('*'):
+            if path.is_symlink():
+                raise RuntimeError(f'Staged file is a symlink: {path}')
+            if path.is_file():
+                actual[path.relative_to(version).as_posix()] = path
+    if actual.keys() != expected.keys():
+        raise RuntimeError('Staged files differ from the reviewed Git tree')
+    for name, entry in expected.items():
+        path = actual[name]
+        content = path.read_bytes()
+        digest = hashlib.sha1(f'blob {len(content)}\0'.encode() + content).hexdigest()
+        executable = bool(path.stat().st_mode & stat.S_IXUSR)
+        if digest != entry['sha'] or executable != (entry['mode'] == '100755'):
+            raise RuntimeError(f'Staged file differs from the reviewed Git tree: {name}')
+
+
+def launcher_plist(home, base, state, model):
+    current = base / 'current'
+    workspace = state / 'workspace'
+    return {
+        'Label': LABEL,
+        'ProgramArguments': [sys.executable, str(current / 'scripts/swarm-opencode.py'),
+                             'review-loop', '--cwd', str(workspace), '--slots', '2', '--model', model],
+        'EnvironmentVariables': {
+            'COMMERCEBUILD_SWARM_STATE': str(state),
+            'PATH': str(home / '.opencode/bin') + ':/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin',
+            'PYTHONDONTWRITEBYTECODE': '1',
+        },
+        'RunAtLoad': True,
+        'KeepAlive': {'SuccessfulExit': False},
+        'StandardOutPath': str(state / 'launchd.stdout.log'),
+        'StandardErrorPath': str(state / 'launchd.stderr.log'),
+    }
+
+
 def install(repo, home, model, migrate_from=None):
     if not model or model.lower().startswith('openrouter/'):
         raise ValueError('Select an explicit non-OpenRouter model for review workers')
@@ -156,10 +219,13 @@ def install(repo, home, model, migrate_from=None):
                 shutil.copytree(repo / name, staging / name,
                                 ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
             shutil.copy2(repo / 'README.md', staging / 'README.md')
+            verify_staged_tree(sha, staging)
             staging.rename(version)
         finally:
             if staging.exists():
                 shutil.rmtree(staging)
+    else:
+        verify_staged_tree(sha, version)
     state.mkdir(parents=True, exist_ok=True)
     workspace = state / 'workspace'
     workspace.mkdir(exist_ok=True)
@@ -172,19 +238,7 @@ def install(repo, home, model, migrate_from=None):
     if not role.is_symlink():
         role.symlink_to(expected_role)
     plist_path.parent.mkdir(parents=True, exist_ok=True)
-    plist = {
-        'Label': LABEL,
-        'ProgramArguments': [sys.executable, str(current / 'scripts/swarm-opencode.py'),
-                             'review-loop', '--cwd', str(workspace), '--slots', '2', '--model', model],
-        'EnvironmentVariables': {
-            'COMMERCEBUILD_SWARM_STATE': str(state),
-            'PATH': str(home / '.opencode/bin') + ':/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin',
-        },
-        'RunAtLoad': True,
-        'KeepAlive': {'SuccessfulExit': False},
-        'StandardOutPath': str(state / 'launchd.stdout.log'),
-        'StandardErrorPath': str(state / 'launchd.stderr.log'),
-    }
+    plist = launcher_plist(home, base, state, model)
     with tempfile.NamedTemporaryFile(dir=plist_path.parent, delete=False) as stream:
         temporary = Path(stream.name)
         plistlib.dump(plist, stream)
@@ -197,10 +251,21 @@ def activate(home):
     base, state, plist = paths(home)
     if not (base / 'current').is_symlink() or not plist.is_file():
         raise RuntimeError('Install a reviewed version before activation')
-    require_reviewed_main_commit((base / 'current').resolve().name)
+    version = (base / 'current').resolve()
+    require_reviewed_main_commit(version.name)
+    verify_staged_tree(version.name, version)
     role = home / '.config/opencode/agents/commercebuild-swarm-reviewer.md'
     if not role.is_symlink() or role.resolve() != (base / 'current/agents/commercebuild-swarm-reviewer.md').resolve():
         raise RuntimeError("The versioned reviewer role isn't installed")
+    config = plistlib.loads(plist.read_bytes())
+    if not isinstance(config, dict):
+        raise RuntimeError('The staged review LaunchAgent has changed')
+    args = config.get('ProgramArguments')
+    if not isinstance(args, list) or len(args) != 9 or not isinstance(args[-1], str):
+        raise RuntimeError('The staged review LaunchAgent has changed')
+    model = args[-1]
+    if not model or model.lower().startswith('openrouter/') or config != launcher_plist(home, base, state, model):
+        raise RuntimeError('The staged review LaunchAgent has changed')
     check_idle(home, state)
     if command('gh', 'api', 'user', '--jq', '.login') != 'commercebuild':
         raise RuntimeError('GitHub account must be commercebuild')
