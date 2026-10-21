@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import re
 import shutil
 import subprocess
 import sys
@@ -100,12 +101,40 @@ def launcher_running(state):
     return True
 
 
+def require_reviewed_main_commit(sha):
+    """Only a merged, approved commit contained in the live main branch may run."""
+    if not re.fullmatch(r'[0-9a-f]{40}', sha or ''):
+        raise RuntimeError('The staged version is not a full Git commit SHA')
+    repo = 'commercebuildteam/commercebuild-dev-swarm'
+    comparison = json.loads(command('gh', 'api', f'repos/{repo}/compare/{sha}...main'))
+    if comparison.get('status') not in ('identical', 'ahead'):
+        raise RuntimeError('The staged commit is not contained in remote main')
+    pulls = json.loads(command('gh', 'api', f'repos/{repo}/commits/{sha}/pulls'))
+    for pr in pulls:
+        if pr.get('merged_at') is None or (pr.get('base') or {}).get('ref') != 'main':
+            continue
+        head = (pr.get('head') or {}).get('sha')
+        if pr.get('merge_commit_sha') != sha and head != sha:
+            continue
+        if not head:
+            continue
+        reviews = command('gh', 'api', '--paginate',
+                          f'repos/{repo}/pulls/{pr["number"]}/reviews',
+                          '--jq', '.[] | {user: .user.login, state, commit_id}')
+        own = [json.loads(line) for line in reviews.splitlines()
+               if line.strip() and json.loads(line).get('user') == 'bhalecb']
+        if own and own[-1].get('state') == 'APPROVED' and own[-1].get('commit_id') == head:
+            return
+    raise RuntimeError('The staged commit has no merged main PR approved on its exact head')
+
+
 def install(repo, home, model, migrate_from=None):
     if not model or model.lower().startswith('openrouter/'):
         raise ValueError('Select an explicit non-OpenRouter model for review workers')
     if command('git', '-C', str(repo), 'status', '--porcelain'):
         raise RuntimeError('Install from a clean, reviewed checkout')
     sha = command('git', '-C', str(repo), 'rev-parse', 'HEAD')
+    require_reviewed_main_commit(sha)
     base, state, plist_path = paths(home)
     if loaded(LABEL):
         raise RuntimeError('The review service is running; stop it before changing versions')
@@ -168,6 +197,7 @@ def activate(home):
     base, state, plist = paths(home)
     if not (base / 'current').is_symlink() or not plist.is_file():
         raise RuntimeError('Install a reviewed version before activation')
+    require_reviewed_main_commit((base / 'current').resolve().name)
     role = home / '.config/opencode/agents/commercebuild-swarm-reviewer.md'
     if not role.is_symlink() or role.resolve() != (base / 'current/agents/commercebuild-swarm-reviewer.md').resolve():
         raise RuntimeError("The versioned reviewer role isn't installed")

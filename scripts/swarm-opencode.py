@@ -763,6 +763,54 @@ def review_intake_loop(stop, interval=60, immediate=True):
                 'review-intake-status.json', immediate=immediate)
 
 
+def assigned_issue_intake_loop(stop, interval=60):
+    """Discover bhalecb-assigned issues independently of worker capacity."""
+    def refresh_assigned():
+        previous = {item.get('url'): item for item in
+                    read(STATE / 'assigned-review-issues.json').get('items', [])}
+        deadline = time.monotonic() + 40
+        rows, total = [], None
+        query = 'org:commercebuildteam is:issue is:open assignee:bhalecb archived:false'
+        for page in range(1, 11):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError('Assigned issue scan exceeded its 40-second budget')
+            result = subprocess.run(
+                ['gh', 'api', '--method', 'GET', 'search/issues', '-f', 'q=' + query,
+                 '-f', 'sort=updated', '-f', 'order=desc', '-f', 'per_page=100',
+                 '-f', f'page={page}'],
+                check=True, capture_output=True, text=True, timeout=min(15, remaining))
+            data = json.loads(result.stdout)
+            if data.get('incomplete_results'):
+                raise RuntimeError('Assigned issue search returned incomplete results')
+            total = data['total_count']
+            rows.extend(data['items'])
+            if len(rows) >= total or not data['items']:
+                break
+        if total is None or len(rows) < total:
+            raise RuntimeError(f'Assigned issue scan covered {len(rows)} of {total} results')
+        items = []
+        observed = stamp()
+        for row in rows:
+            url = row.get('html_url') or ''
+            if not re.fullmatch(r'https://github\.com/commercebuildteam/[A-Za-z0-9_.-]+/issues/\d+', url):
+                continue
+            old_evidence = (previous.get(url) or {}).get('request_evidence') or []
+            assigned_at = (old_evidence[0].get('created_at') if old_evidence else None) or observed
+            items.append({'url': url, 'title': row.get('title') or '',
+                          'state': 'assigned-review', 'next_owner': 'bhalecb',
+                          'request_evidence': [{'kind': 'assigned_issue', 'id': url,
+                                                'created_at': assigned_at}]})
+        atomic(STATE / 'assigned-review-issues.json',
+               {'checked_at': stamp(), 'items': items})
+        return {'count': len(items)}
+
+    run_cadence(stop, interval,
+                (('assigned_issues', refresh_assigned),
+                 ('queue_intake', lambda: record_high_tier(None))),
+                'assigned-issue-intake-status.json', immediate=True)
+
+
 BLOCKED_RE = re.compile(
     r'scope[- ]gate[^\n]{0,120}?(fail|not met)'
     r'|not assigned to `?commercebuild`?'
@@ -1029,6 +1077,26 @@ def verify_review_completion(entry, checkpoint, started_at):
     repo = (entry.get('repo') or '').lower()
     ticket = entry.get('issue') or ''
     since = parse_ts(started_at)
+    if '/issues/' in ticket:
+        match = TICKET_RE.match(ticket)
+        if not match:
+            return 'incomplete', 'invalid assigned issue URL'
+        try:
+            result = subprocess.run(
+                ['gh', 'api', '--paginate',
+                 f'repos/{match.group(1)}/issues/{match.group(2)}/comments',
+                 '--jq', '.[] | select(.user.login == "commercebuild") | '
+                 '{body, submitted_at: .created_at}'],
+                check=True, capture_output=True, text=True, timeout=30)
+            comments = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+        except Exception as exc:
+            return 'incomplete', f'{ticket}: {type(exc).__name__}: could not read issue comments'
+        for comment in comments:
+            at = parse_ts(comment.get('submitted_at'))
+            body = comment.get('body') or ''
+            if at and since and at >= since and ticket in body and REVIEW_RESULT_RE.search(body):
+                return 'completed', f'{ticket} has a reviewer result comment from this run'
+        return 'incomplete', 'no reviewer result was posted on the assigned issue during this run'
     candidates = [u for u in re.findall(r'https://github\.com/commercebuildteam/[^/\s]+/pull/\d+', checkpoint or '')
                   if u.lower().startswith('https://github.com/' + repo + '/')]
     if '/pull/' in ticket and ticket not in candidates:
@@ -1350,7 +1418,8 @@ def prepare_entry(session, entry, quiet=False):
     if '/pull/' in ticket or '/issues/' in ticket:
         try:
             kind = 'pr' if '/pull/' in ticket else 'issue'
-            current = gh_json(kind, 'view', ticket, '--json', 'state')
+            fields = 'state,assignees' if kind == 'issue' and entry.get('kind') == 'review' else 'state'
+            current = gh_json(kind, 'view', ticket, '--json', fields)
         except Exception as exc:
             if not quiet:
                 log(f'[dispatch] {worker_id}: cannot verify ticket state yet '
@@ -1366,6 +1435,12 @@ def prepare_entry(session, entry, quiet=False):
                 release_claim(session, claim_id, 'ticket closed before dispatch')
             log(f'[dispatch] {worker_id}: {state} without worker '
                 f'(ticket {current.get("state", "unknown").lower()} before dispatch)')
+            return None
+        if kind == 'issue' and entry.get('kind') == 'review' and \
+                'bhalecb' not in {a.get('login') for a in current.get('assignees') or []}:
+            set_queue_state(worker_id, state='skipped', reason='Review assignment removed before dispatch')
+            if bound:
+                release_claim(session, claim_id, 'review assignment removed')
             return None
     if not bound:
         # A coordinator can exit after writing prompts but before the claim
@@ -1847,10 +1922,20 @@ def write_prompt(worker_id, repo, url, title, note='', mode='developer'):
     prompt_path = STATE / 'dispatch' / (worker_id + '.md')
     if mode == 'review':
         prompt_path.parent.mkdir(parents=True, exist_ok=True)
+        if '/issues/' in url:
+            prompt_path.write_text(
+                'You are the commercebuild reviewer. Work only on this assigned issue.\n\n'
+                f'REPOSITORY: {repo}\nITEM: {url}\n\nTITLE: {title}\n\n'
+                'Review the issue, its linked work, and current evidence. Do not implement, '
+                'approve, merge, deploy, or close anything. Post one concise factual issue '
+                'comment with the exact issue URL and the line "Review result: findings '
+                'posted" or "Review result: no findings". Name the next actor and action. '
+                'Return a checkpoint with the checks and result.\n')
+            return prompt_path
         prompt_path.write_text(
-            'You are the Woo Reviewer acting for bhalecb. Work only on this review item.\n\n'
+            'You are the commercebuild reviewer. Work only on this review item.\n\n'
             f'REPOSITORY: {repo}\nITEM: {url}\n\nTITLE: {title}\n\n'
-            'This is a reviewer-only job. Review the pull request as bhalecb: read the '
+            'This is a reviewer-only job. Review the pull request: read the '
             'current head, run the repository gates, and post your review findings. Post '
             'the findings as a GitHub review on the current head. If you post them as a '
             'comment instead, include the exact head SHA and one line "Review result: '
@@ -2138,7 +2223,12 @@ def record_high_tier(session):
     handled = read(STATE / 'dispatch' / 'handled-reviews.json')
     review_snapshot = review_intake.snapshot(STATE)
     candidates = {i['url']: i for i in review_intake.runnable_items(review_snapshot)
-                  if i.get('donavon_request') and i.get('url')}
+                  if (i.get('donavon_request') or i.get('bhalecb_routed')
+                      or i.get('delegated')) and i.get('url')
+                  and i.get('state') != 'draft-held'}
+    for issue in read(STATE / 'assigned-review-issues.json').get('items', []):
+        if issue.get('url'):
+            candidates[issue['url']] = issue
     for promotion in promotion_source.items(STATE):
         if promotion.get('next_owner') != 'bhalecb' or not promotion.get('url'):
             continue
@@ -2619,6 +2709,11 @@ def run_round(args, final_status='stopped'):
         reviews = threading.Thread(target=review_intake_loop, args=(stop, 60, True), daemon=True,
                                    name='review-intake')
         reviews.start()
+        assigned = None
+        if review_only:
+            assigned = threading.Thread(target=assigned_issue_intake_loop, args=(stop, 60),
+                                        daemon=True, name='assigned-issue-intake')
+            assigned.start()
         promotions = threading.Thread(target=promotion_intake_loop, args=(stop, 60, review_only),
                                       daemon=True, name='promotion-intake')
         promotions.start()
@@ -2662,6 +2757,8 @@ def run_round(args, final_status='stopped'):
                 watcher.join(timeout=30)
             freshness.join()
             reviews.join()
+            if assigned:
+                assigned.join()
             promotions.join()
             release_all_claims('round ended; launcher reconciliation', session=session)
             with RUNTIME_MUTEX:
