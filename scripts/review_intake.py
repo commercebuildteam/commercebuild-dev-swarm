@@ -83,16 +83,18 @@ def classify(n,comment_evidence=None):
  donavon_event=any(actor==DONAVON and who=='bhalecb' for at,actor,who,_ in events) and 'bhalecb' in current
  donavon_comment=bool(comment_evidence)
  donavon=donavon_event or donavon_comment
- evidence=[]
- if donavon_event:
-  at,actor,eid=max((at,actor,eid) for at,actor,who,eid in events if actor==DONAVON and who=='bhalecb')
-  evidence.append({'kind':'review_requested_event','id':eid,'actor':actor,'requested_reviewer':'bhalecb','created_at':at})
- evidence.extend(comment_evidence or [])
+ evidence=list(comment_evidence or [])
+ evidence.extend({'kind':'review_requested_event','id':eid,'actor':actor,
+            'requested_reviewer':who,'created_at':at}
+           for at,actor,who,eid in events
+           if (who=='bhalecb' and 'bhalecb' in current)
+           or (who=='commercebuild' and 'commercebuild' in current
+               and actor in {'bhalecb',DONAVON}))
  routed='bhalecb' in current
  if not ((current&TARGETS) or comment_evidence):return None
  state='queued-for-delegated-review' if delegated else ('awaiting-bhalecb-delegation' if routed else 'requires-bhalecb-routing')
  if n['isDraft']:state='draft-held'
- return {'url':n['url'],'title':n['title'],'head':n['headRefOid'],'priority':'High' if donavon else None,'priority_reason':'Donavon review request: minimum High' if donavon else 'No requester priority override','state':state,'delegated':delegated,'donavon_request':donavon,'request_evidence':evidence,'updated_at':n.get('updatedAt'),'timeline_truncated':n['timelineItems']['pageInfo']['hasPreviousPage']}
+ return {'url':n['url'],'title':n['title'],'head':n['headRefOid'],'priority':'High' if donavon else None,'priority_reason':'Donavon review request: minimum High' if donavon else 'No requester priority override','state':state,'delegated':delegated,'bhalecb_routed':routed,'donavon_request':donavon,'request_evidence':evidence,'updated_at':n.get('updatedAt'),'timeline_truncated':n['timelineItems']['pageInfo']['hasPreviousPage']}
 def query(q,deadline=None):
  p=subprocess.run(['gh','api','graphql','-f','query='+q],capture_output=True,text=True,timeout=call_timeout(deadline))
  if p.returncode:raise RuntimeError('GitHub review intake query failed')

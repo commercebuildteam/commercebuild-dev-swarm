@@ -1354,7 +1354,7 @@ class ReviewerRoutingAndCapacity(unittest.TestCase):
                                 'issue': f'https://github.com/commercebuildteam/r/pull/{n + 100}',
                                 'state': 'completed', 'kind': 'review',
                                 'review_signature': f'other-{n}',
-                                'updated_at': f'2026-10-21T00:{n:02d}:00Z'})
+                                'updated_at': f'2099-10-21T00:{n:02d}:00Z'})
         module.update_queue(add_outcomes)
         module.compact_queue()
         self.assertNotIn(worker_id, {e['worker_id'] for e in module.read_queue()})
@@ -1374,10 +1374,10 @@ class ReviewerRoutingAndCapacity(unittest.TestCase):
                  'head': 'a' * 40, 'request_evidence': [{'kind': 'comment', 'id': '1'}],
                  'state': state, 'updated_at': '2026-10-15T11:00:00Z'}]}))
 
-        snapshot('draft-held')
+        snapshot('requires-bhalecb-routing')
         recorded = module.record_high_tier('session-x')
         module.set_queue_state(recorded[0]['worker_id'], state='completed')
-        snapshot('requires-bhalecb-routing')
+        snapshot('queued-for-delegated-review')
         self.assertEqual(len(module.record_high_tier('session-x')), 1)
 
     def test_promotion_and_donavon_request_share_one_settled_identity(self):
@@ -1494,7 +1494,7 @@ class ReviewerRoutingAndCapacity(unittest.TestCase):
                                 'issue': f'https://github.com/commercebuildteam/r/pull/{n + 100}',
                                 'state': 'completed', 'kind': 'review',
                                 'review_signature': f'other-{n}',
-                                'updated_at': f'2026-10-21T00:{n:02d}:00Z'})
+                                'updated_at': f'2099-10-21T00:{n:02d}:00Z'})
         module.update_queue(add_outcomes)
         module.compact_queue()
         self.assertNotIn(worker_id, {e['worker_id'] for e in module.read_queue()})
@@ -1797,8 +1797,9 @@ class ReviewerRoutingAndCapacity(unittest.TestCase):
         self.assertTrue(snapshot['errors'])
         self.assertTrue(snapshot['partial'])
         self.assertIn(DONAVON_PR, {i['url'] for i in snapshot['items']})
-        self.assertEqual(len(module.record_high_tier('session-x')), 1)
-        self.assertEqual(module.read_queue()[0]['issue'], DONAVON_PR)
+        self.assertEqual(len(module.record_high_tier('session-x')), 2)
+        self.assertEqual({entry['issue'] for entry in module.read_queue()},
+                         {DONAVON_PR, unrelated['url']})
 
     def test_launcher_waits_for_dashboard_scan_before_queueing(self):
         module = self._module()
