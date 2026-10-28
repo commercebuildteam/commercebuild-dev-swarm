@@ -1,7 +1,7 @@
 """Read-only priority visibility, using the scheduler's actual cached evidence."""
 import html
 from datetime import datetime,timezone
-RANK={'Promotion':0,'Urgent':1,'High':2,'Medium':3,'Low':4}
+import priority_schedule
 def esc(x):return html.escape(str(x or ''),quote=True)
 def status(item,entries,live,claims,owners,paused):
  url=item['url'];related={url,*item.get('linked_issues',[])}
@@ -39,9 +39,10 @@ def render(snapshot,entries,live,claims,owners,paused):
    for e in entries:
     if e.get('issue')==item['url']:
      expanded.extend(dict(e,issue=u) for u in item.get('linked_issues',[]))
- for item in sorted(items,key=lambda x:(RANK.get(x.get('priority'),5),x['url'])):
+ for item in sorted(items,key=lambda x:(priority_schedule.tier(x),x['url'])):
   level=item.get('priority') or 'Unset / unknown';url=item['url'];source=item.get('source');inherit=''
-  if source and source!=url:inherit='<br><small>From <a href="'+esc(source)+'">'+esc(source.split('/')[-1])+'</a></small>'
+  if item.get('donavon_request'):inherit+='<br><small>Donavon review request: above ticket priorities</small>'
+  if source and source!=url:inherit='<br><small>From <a href="'+esc(source)+'">'+esc(source.split('/')[-1])+'</a></small>'+inherit
   row='<tr><td><strong>'+esc(level)+'</strong>'+inherit+'</td><td><a href="'+esc(url)+'">'+esc('/'.join(url.split('/')[4:]))+'</a><br>'+esc(item.get('title'))+'</td><td>'+esc(status(item,expanded,live,claims,owners,paused))+'</td></tr>'
   (known if item.get('priority') else unknown).append(row)
  captured=snapshot.get('captured_at');fresh=False
@@ -50,4 +51,4 @@ def render(snapshot,entries,live,claims,owners,paused):
  health='Current' if fresh and not snapshot.get('errors') else 'Stale or unavailable: ordering may use older values'
  if any(snapshot.get('truncated',{}).values()):health+='; coverage incomplete'
  header='<tr><th>Priority</th><th>Ticket / PR</th><th>Scheduling status</th></tr>'
- return '<section id="priority-work"><h2>Priority work</h2><p>'+esc(health)+' | Last priority fetch: '+esc(captured or 'not yet available')+'</p><p>Urgent &gt; High &gt; Medium &gt; Low &gt; unset. Priorities refresh about every minute. Active work and repository ownership are preserved. Priority is not a completion guarantee.</p><table>'+header+(''.join(known) or '<tr><td colspan="3">No explicit priorities recorded.</td></tr>')+'</table><details><summary>Unset / unknown priority ('+str(len(unknown))+')</summary><table>'+header+''.join(unknown)+'</table></details></section>'
+ return '<section id="priority-work"><h2>Priority work</h2><p>'+esc(health)+' | Last priority fetch: '+esc(captured or 'not yet available')+'</p><p>Promotions first, then verified Donavon review requests, then Urgent &gt; High &gt; Medium &gt; Low &gt; unset. Priorities refresh about every minute. Active work and repository ownership are preserved. Priority is not a completion guarantee.</p><table>'+header+(''.join(known) or '<tr><td colspan="3">No explicit priorities recorded.</td></tr>')+'</table><details><summary>Unset / unknown priority ('+str(len(unknown))+')</summary><table>'+header+''.join(unknown)+'</table></details></section>'

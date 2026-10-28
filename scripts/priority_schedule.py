@@ -30,9 +30,25 @@ def refresh(state,background=True):
  else:run()
  return snapshot(state)
 
+# Scheduling tiers: verified promotions first, then verified Donavon review
+# requests, then the ordinary ticket priority. A request goes ahead of every
+# ticket priority, including critical and security work. The total worker cap and
+# one worker per repository still bound how many run at once: there is no separate
+# review cap.
+PROMOTION_TIER=0
+REQUEST_TIER=1
+TICKET_TIER=2
+
+def tier(item):
+ """Scheduling tier for one row. Unverified promotion stubs keep the bottom tier
+ with unset work, so they never rank above verified rows."""
+ if item.get('priority')=='Promotion':return PROMOTION_TIER
+ if item.get('donavon_request'):return REQUEST_TIER
+ return TICKET_TIER+RANK.get(item.get('priority'),5)
+
 def rank_map(state):
  items=merge_items(state)
- return {x['url']:RANK.get(x.get('priority'),5) for x in items}
+ return {x['url']:tier(x) for x in items}
 
 def effective_priority(native, floor):
  """Apply the Donavon HIGH floor over a linked-ticket priority without downgrading
@@ -58,6 +74,8 @@ def merged_snapshot(state):
   for url,item in reviews.items():
    # The request supplies a HIGH floor over the linked-ticket priority: a Medium
    # or Low linked ticket never lowers it below HIGH, and Urgent stays above.
+   # Ordering doesn't rely on that floor: tier() schedules every verified request
+   # below promotions and above all ticket priorities.
    floor=item.get('priority')
    existing=rows.get(url)
    merged=dict(item)
@@ -82,6 +100,8 @@ def merge_items(state):
 
 def order(rows,state):
  ranks=rank_map(state)
+ default=tier({})  # no snapshot row: bottom tier, same as unset work
  # Python's stable sort preserves existing age/recovery fairness within a tier.
- # Promotions (rank 0) order above every ticket priority and the oldest-work lanes.
- return sorted(rows,key=lambda r:min(ranks.get(r.get('url'),5),ranks.get(r.get('issue'),5)))
+ # Promotions order above every Donavon review request, and a request orders above
+ # every ticket priority.
+ return sorted(rows,key=lambda r:min(ranks.get(r.get('url'),default),ranks.get(r.get('issue'),default)))

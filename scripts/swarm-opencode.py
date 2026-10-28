@@ -1629,22 +1629,16 @@ def dispatch_round(args, model, session):
                            and (not getattr(args, 'review_only', False) or e.get('kind') == 'review')]
                 pending = priority_schedule.order(pending, STATE)
                 waiting = 0
-                # Donavon-requested reviews: intake is independent of capacity (all
-                # pending requests stay queued and visible), but at most two run
-                # concurrently within the total worker cap and repository serialization.
-                donavon_urls = {i['url'] for i in review_intake.snapshot(STATE).get('items', [])
-                                if i.get('donavon_request')}
-                running_reviews = sum(1 for e in read_queue()
-                                      if e.get('state') == 'running' and e.get('issue') in donavon_urls)
+                # Donavon-requested reviews queue and dispatch like any other review
+                # work: promotions rank above them, they rank above every ticket
+                # priority, and there is no separate review cap. The total worker cap
+                # and one worker per repository still bound them.
                 round_repos = set()  # one worker per repository within this pass
                 for entry in pending:
                     if active >= SLOTS or time.time() < QUOTA_PAUSE_UNTIL[0]:
                         waiting += 1
                         continue
                     if entry.get('repo') in round_repos:
-                        waiting += 1
-                        continue
-                    if not review_intake.can_dispatch(entry.get('issue'), donavon_urls, running_reviews):
                         waiting += 1
                         continue
                     worker_id = entry.get('worker_id')
@@ -1659,8 +1653,6 @@ def dispatch_round(args, model, session):
                     known.add(entry_key(entry))
                     claim_logged.discard(worker_id)
                     round_repos.add(entry.get('repo'))
-                    if entry.get('issue') in donavon_urls:
-                        running_reviews += 1
                     futures[pool.submit(run_entry, args, model, session, item)] = worker_id
                     active += 1
                 thread = backfill['thread']
@@ -2118,9 +2110,11 @@ def high_tier_rows(state, seen_urls):
     """Extra intake rows from the promotion and Donavon-review snapshots.
 
     Promotions are the top scheduling tier and enter the runnable queue like any
-    other ticket. Donavon-requested reviews are ingested independently of developer
-    capacity; the two-concurrent review cap is applied at dispatch time, so a request
-    recorded while every slot is full is still queued and starts when a slot frees.
+    other ticket. Donavon-requested reviews rank below promotions and above every
+    ticket priority, and they are ingested independently of developer capacity, so
+    a request recorded while every slot is full is still queued and starts when a
+    slot frees. There is no separate review cap; the total worker cap and one worker
+    per repository bound dispatch.
     """
     sources = ((promotion_source.items(state), 'updatedAt'),
                ((i for i in review_intake.runnable_items(review_intake.snapshot(state))
@@ -2203,8 +2197,8 @@ def record_high_tier(session):
 
     Donavon-requested reviews, verified promotions, and classified promotions whose
     lineage is still unverified must stay queued and visible while every
-    developer slot is claimed; the two-concurrent review cap remains a
-    dispatch-time check, so freeing a slot starts an already-queued review without
+    developer slot is claimed; dispatch applies the total worker cap and one worker
+    per repository, so freeing a slot starts an already-queued review without
     re-discovery. Unverified candidates queue at a safe bottom-tier priority and
     never rank above verified work. No claim is taken here: prepare_entry claims
     at dispatch time.

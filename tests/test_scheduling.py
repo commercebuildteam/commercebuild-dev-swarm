@@ -660,7 +660,9 @@ class PromotionCollection(unittest.TestCase):
         merged = priority_schedule.merged_snapshot(self.state)
         rows = {i['url']: i for i in merged['items']}
         self.assertEqual(rows[promo_url]['priority'], 'Promotion (unverified)')
-        self.assertEqual(priority_schedule.rank_map(self.state)[promo_url], 5)
+        # An unverified stub keeps the same bottom tier as unset work.
+        self.assertEqual(priority_schedule.rank_map(self.state)[promo_url],
+                         priority_schedule.tier({}))
 
         # A warm refresh with unchanged PRs reuses the cached classification and
         # lists no repository again.
@@ -959,6 +961,42 @@ class Ordering(unittest.TestCase):
         ordered = priority_schedule.order(self.rows([other, url]), self.state)
         self.assertEqual(ordered[0]['url'], other)
 
+    def test_donavon_request_ranks_between_promotions_and_every_ticket(self):
+        """October 26 policy: promotions first, verified Donavon requests second,
+        then ordinary ticket priorities, including Urgent/critical work."""
+        promo = promotion_node()['url']
+        request = DONAVON_PR
+        urgent = 'https://github.com/commercebuildteam/r/issues/1'
+        high = 'https://github.com/commercebuildteam/r/pull/2'
+        self.write([{'url': urgent, 'priority': 'Urgent'},
+                    {'url': high, 'priority': 'High'}])
+        (self.state / 'review-intake.json').write_text(json.dumps(
+            {'items': [{'url': request, 'donavon_request': True, 'priority': 'High'}]}))
+        (self.state / 'promotion-snapshot.json').write_text(json.dumps(
+            {'items': [{'url': promo, 'priority': 'Promotion'}]}))
+        ordered = priority_schedule.order(self.rows([high, urgent, request, promo]), self.state)
+        self.assertEqual([r['url'] for r in ordered], [promo, request, urgent, high])
+        # A queue entry carries its URL under 'issue'; the same tier applies.
+        ordered = priority_schedule.order([{'issue': urgent}, {'issue': request}], self.state)
+        self.assertEqual([r['issue'] for r in ordered], [request, urgent])
+
+    def test_dashboard_lists_a_request_above_an_urgent_ticket(self):
+        promo = promotion_node()['url']
+        request = DONAVON_PR
+        urgent = 'https://github.com/commercebuildteam/r/issues/1'
+        self.write([{'url': urgent, 'title': 'Urgent ticket', 'priority': 'Urgent'}])
+        (self.state / 'review-intake.json').write_text(json.dumps(
+            {'items': [{'url': request, 'title': 'Requested review',
+                        'donavon_request': True, 'priority': 'High'}]}))
+        (self.state / 'promotion-snapshot.json').write_text(json.dumps(
+            {'items': [{'url': promo, 'title': 'Promotion', 'priority': 'Promotion'}]}))
+        import priority_dashboard
+        html = priority_dashboard.render(priority_schedule.merged_snapshot(self.state),
+                                         [], set(), {}, {}, False)
+        self.assertLess(html.index(promo), html.index(request))
+        self.assertLess(html.index(request), html.index(urgent))
+        self.assertIn('Donavon review request: above ticket priorities', html)
+
 
 DONAVON_PR = 'https://github.com/commercebuildteam/r/pull/7'
 
@@ -1063,15 +1101,101 @@ class DonavonClassification(unittest.TestCase):
 
 
 class Capacity(unittest.TestCase):
-    def test_two_active_cap_and_intake_independence(self):
-        donavon = {DONAVON_PR}
-        self.assertTrue(review_intake.can_dispatch(DONAVON_PR, donavon, 1))
-        self.assertFalse(review_intake.can_dispatch(DONAVON_PR, donavon, 2))
-        # A non-Donavon ticket is never capped by the review limit.
-        self.assertTrue(review_intake.can_dispatch('https://github.com/commercebuildteam/r/issues/1', donavon, 5))
+    """October 26 policy: Donavon's verified requests rank below promotions and
+    above every ticket priority, with no separate review cap. The total worker cap
+    and one worker per repository still bound dispatch."""
 
-    def test_cap_constant_within_total_cap(self):
-        self.assertLessEqual(review_intake.MAX_CONCURRENT_REVIEWS, 2)
+    def setUp(self):
+        self.state = Path(tempfile.mkdtemp())
+
+    def _module(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            'swarm_opencode_dispatch_' + str(id(self)),
+            Path(__file__).resolve().parent.parent / 'scripts' / 'swarm-opencode.py')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.STATE = self.state
+        return module
+
+    def dispatch(self, urls, slots):
+        """Run one dispatch round over review entries for `urls` with `slots` total
+        workers. Workers block until released, so the first pass shows exactly how
+        much work dispatch admits concurrently."""
+        module = self._module()
+        module.SLOTS = slots
+        module.QUEUE_PATH = self.state / 'dispatch' / 'queue.json'
+        (self.state / 'dispatch').mkdir(parents=True, exist_ok=True)
+        module.QUEUE_PATH.write_text(json.dumps({'queue': [
+            {'worker_id': 'w-' + str(i), 'issue': u,
+             'repo': '/'.join(u.split('/')[3:5]), 'kind': 'review', 'state': 'pending',
+             'claim_id': 'c-' + str(i), 'updated_at': '2026-10-15T11:00:00Z'}
+            for i, u in enumerate(urls)]}))
+        (self.state / 'review-intake.json').write_text(json.dumps({'items': [
+            {'url': u, 'donavon_request': True, 'priority': 'High'} for u in urls]}))
+        released = threading.Event()
+        guard = threading.Lock()
+        live = {'now': 0, 'peak': 0, 'started': []}
+
+        def fake_run(*args, **kwargs):
+            with guard:
+                live['now'] += 1
+                live['peak'] = max(live['peak'], live['now'])
+                live['started'].append(args[3][0]['issue'])
+            released.wait(10)
+            with guard:
+                live['now'] -= 1
+            return True
+
+        thread = threading.Thread(target=module.dispatch_round, daemon=True, args=(
+            argparse.Namespace(review_only=True), 'model', 'session-x'))
+        with mock.patch.object(module, 'heartbeat', lambda *a, **k: None), \
+             mock.patch.object(module.priority_schedule, 'refresh', lambda *a, **k: {}), \
+             mock.patch.object(module, 'prepare_entry',
+                               lambda session, entry, quiet=False: (entry, 'claim', 'prompt')), \
+             mock.patch.object(module, 'run_entry', fake_run):
+            thread.start()
+            # Let the first pass fill every slot it is allowed to use: the total cap
+            # and one worker per repository.
+            repos = {u.split('/')[4] for u in urls}
+            expected_first = min(slots, len(repos))
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and len(live['started']) < expected_first:
+                time.sleep(0.02)
+            time.sleep(0.3)  # an over-admitting pass would start extra workers here
+            first_pass = {'peak': live['peak'], 'started': list(live['started'])}
+            released.set()
+            thread.join(timeout=15)
+        self.assertFalse(thread.is_alive())
+        first_pass['total'] = len(live['started'])
+        first_pass['peak_total'] = live['peak']
+        return first_pass
+
+    def test_three_requests_from_different_repositories_run_together(self):
+        """No separate review cap: with three slots, three verified requests from
+        different repositories run at the same time."""
+        urls = ['https://github.com/commercebuildteam/r1/pull/1',
+                'https://github.com/commercebuildteam/r2/pull/2',
+                'https://github.com/commercebuildteam/r3/pull/3']
+        result = self.dispatch(urls, 3)
+        self.assertEqual(sorted(result['started']), sorted(urls))
+        self.assertEqual(result['peak'], 3)
+
+    def test_total_worker_cap_and_one_worker_per_repository_hold(self):
+        """Requests never exceed the total worker cap, and a second PR in the same
+        repository waits for the first to finish."""
+        urls = ['https://github.com/commercebuildteam/r1/pull/1',
+                'https://github.com/commercebuildteam/r2/pull/2',
+                'https://github.com/commercebuildteam/r2/pull/3',
+                'https://github.com/commercebuildteam/r3/pull/4']
+        result = self.dispatch(urls, 4)
+        # The first pass admits r1, r2 pull/2 and r3; r2 pull/3 waits its turn.
+        self.assertEqual(sorted(result['started']), sorted([urls[0], urls[1], urls[3]]))
+        self.assertEqual(result['peak'], 3)
+        # Every request still runs once the repository and slots free up.
+        self.assertEqual(result['total'], 4)
+        self.assertEqual(result['peak_total'], 3)
+
 
 
 class PersistenceAndRestart(unittest.TestCase):
@@ -1985,8 +2109,10 @@ class ReviewerRoutingAndCapacity(unittest.TestCase):
         self.assertEqual(rows[stub_url]['priority'], 'High')
         self.assertEqual(rows[lone]['kind'], 'promotion-candidate')
         ranks = priority_schedule.rank_map(self.state)
-        self.assertEqual(ranks[DONAVON_PR], priority_schedule.RANK['High'])
-        self.assertEqual(ranks[stub_url], priority_schedule.RANK['High'])
+        # A verified Donavon request outranks every ticket priority and sits directly
+        # below promotions, whatever its displayed HIGH floor is.
+        self.assertEqual(ranks[DONAVON_PR], priority_schedule.REQUEST_TIER)
+        self.assertEqual(ranks[stub_url], priority_schedule.REQUEST_TIER)
         self.assertNotIn(lone, module.review_entry_urls(self.state))
         self.assertNotIn(lone, {r['url'] for r in module.high_tier_rows(self.state, set())})
         recorded = module.record_high_tier('session-x')
