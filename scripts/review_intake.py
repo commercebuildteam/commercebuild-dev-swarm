@@ -112,12 +112,6 @@ def runnable_items(data):
  """Only current open-PR search results can become new jobs on a partial scan."""
  verified=set(data.get('open_verified_urls') or [])
  return [i for i in data.get('items',[]) if not data.get('partial') or i.get('url') in verified]
-MAX_CONCURRENT_REVIEWS=2
-def can_dispatch(issue,donavon_urls,running_reviews):
- """Donavon-requested review intake is independent of capacity: every request stays
- queued and visible, but at most MAX_CONCURRENT_REVIEWS run concurrently within the
- total worker cap and one worker per repository."""
- return not (issue in donavon_urls and running_reviews>=MAX_CONCURRENT_REVIEWS)
 def inspect_candidate(n,deadline,priorities,old_items):
  """Inspect one PR without mutating the snapshot; callers retain completed work."""
  errors=[];comment_evidence=[];linked_issue_priorities=[];failed=False
@@ -186,7 +180,7 @@ def refresh(state):
   now=datetime.datetime.now(datetime.timezone.utc).isoformat()
   try:old=json.loads(path.read_text())
   except (OSError,ValueError):old={}
-  result={'checked_at':now,'interval_seconds':60,'max_concurrent_reviews':2,'execution_enabled':True,'items':[],'errors':[],'truncated':{}}
+  result={'checked_at':now,'interval_seconds':60,'execution_enabled':True,'items':[],'errors':[],'truncated':{}}
   deadline=time.monotonic()+DISCOVERY_SECONDS
   try:priorities={i['url']:i.get('priority') for i in json.loads((state/'priority-snapshot.json').read_text())['items']}
   except (OSError,ValueError,KeyError):priorities={}
@@ -283,4 +277,4 @@ def render(data):
  stale=set(data.get('stale_urls') or [])
  open_verified=set(data.get('open_verified_urls') or [])
  rows=''.join('<tr><td>'+esc(i.get('priority') or 'Unset')+'</td><td><a href="'+esc(i['url'])+'">'+esc(i['title'])+'</a></td><td>'+esc(i.get('state'))+(' (stale; details incomplete)' if i['url'] in stale and i['url'] in open_verified else ' (stale; open state unverified)' if i['url'] in stale else '')+'</td><td>'+esc(i.get('priority_reason'))+'</td></tr>' for i in data.get('items',[]))
- return '<section><h2>Review intake</h2><p>Checked '+esc(data.get('checked_at'))+' | Last successful '+esc(data.get('last_success_at'))+' | Every 60 seconds while awake. All requests retained independently of developer capacity. Queued Donavon-requested reviews run as reviewer jobs: at most 2 concurrently within the developer worker cap, one per repository.</p><p>'+esc(data.get('errors') or '')+'</p><table><tr><th>Priority</th><th>PR</th><th>Routing</th><th>Reason</th></tr>'+rows+'</table></section>'
+ return '<section><h2>Review intake</h2><p>Checked '+esc(data.get('checked_at'))+' | Last successful '+esc(data.get('last_success_at'))+' | Every 60 seconds while awake. All requests retained independently of developer capacity. Queued Donavon-requested reviews run as reviewer jobs: promotions rank above them and they rank above every ticket priority. The total worker cap and one worker per repository bound them; there is no separate review cap.</p><p>'+esc(data.get('errors') or '')+'</p><table><tr><th>Priority</th><th>PR</th><th>Routing</th><th>Reason</th></tr>'+rows+'</table></section>'
