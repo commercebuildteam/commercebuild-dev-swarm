@@ -37,6 +37,8 @@ DEFAULT_MODEL = 'openrouter/z-ai/glm-5.3-flash'  # Override per run with --model
 # `commercebuild`. Reassigning a ticket to bhalecb is the hand-back signal, so
 # intake must never dispatch bhalecb-held tickets to a worker.
 DEFAULT_ASSIGNEE = 'commercebuild'
+COMMERCEBUILD_LOGIN = 'commercebuild'
+COMMERCEBUILD_EMAIL = '93682519+commercebuild@users.noreply.github.com'
 LAUNCHD_LABEL = 'com.commercebuild.opencode-swarm'
 SLOTS = 12                     # default concurrent developers; override with --slots on run/loop
 WORKER_CAP_SECONDS = 2700      # 45-minute cap per worker
@@ -600,7 +602,49 @@ def release_claim(session, claim_id, reason):
         return entry
 
 
+def github_identity():
+    """The GitHub identity every worker call must use.
+
+    Workers inherit this process's environment, so pinning the token and git
+    identity here stops a `gh` or `git push` in a worker from falling back to
+    whichever account is active in the user's gh config. The token is verified
+    against the GitHub API before it is used.
+    """
+    try:
+        result = subprocess.run(['gh', 'auth', 'token', '-u', COMMERCEBUILD_LOGIN],
+                                check=False, capture_output=True, text=True, timeout=25)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise RuntimeError(f'Could not read the {COMMERCEBUILD_LOGIN} GitHub token: {error}') from error
+    token = result.stdout.strip()
+    if result.returncode or not token:
+        raise RuntimeError(f'gh returned no token for {COMMERCEBUILD_LOGIN}')
+    verify_env = {**os.environ, 'GH_TOKEN': token}
+    try:
+        result = subprocess.run(['gh', 'api', 'user', '--jq', '.login'],
+                                check=False, capture_output=True, text=True, timeout=25,
+                                env=verify_env)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise RuntimeError(f'Could not verify the {COMMERCEBUILD_LOGIN} GitHub identity: {error}') from error
+    login = result.stdout.strip()
+    if result.returncode or login != COMMERCEBUILD_LOGIN:
+        raise RuntimeError(f'GitHub account must be {COMMERCEBUILD_LOGIN}; gh reports {login or "no account"}')
+    return {
+        'GH_TOKEN': token,
+        'GITHUB_TOKEN': token,
+        'GH_HOST': 'github.com',
+        'GIT_AUTHOR_NAME': COMMERCEBUILD_LOGIN,
+        'GIT_AUTHOR_EMAIL': COMMERCEBUILD_EMAIL,
+        'GIT_COMMITTER_NAME': COMMERCEBUILD_LOGIN,
+        'GIT_COMMITTER_EMAIL': COMMERCEBUILD_EMAIL,
+        'GIT_TERMINAL_PROMPT': '0',
+        'GIT_CONFIG_COUNT': '1',
+        'GIT_CONFIG_KEY_0': 'credential.https://github.com.helper',
+        'GIT_CONFIG_VALUE_0': '!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f',
+    }
+
+
 def preflight(review_only=False):
+    os.environ.update(github_identity())
     if other_swarm_active():
         raise RuntimeError(
             'Another commercebuild swarm is active (Claude or Codex). '
@@ -619,8 +663,6 @@ def preflight(review_only=False):
     released = release_all_claims('stale claim: owning launcher is not running')
     if released:
         log(f'released {len(released)} stale claim(s) from a dead launcher: {", ".join(released)}')
-    if gh_json('api', 'user').get('login') != 'commercebuild':
-        raise RuntimeError('GitHub account must be commercebuild; no automatic account switching')
     config_dir = Path.home() / '.config/opencode/agents'
     roles = (REVIEWER_AGENT,) if review_only else (COORDINATOR_AGENT, DEVELOPER_AGENT, REVIEWER_AGENT)
     for role in roles:
