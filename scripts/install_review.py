@@ -22,6 +22,7 @@ OTHER_LABELS = (
     'com.commercebuild.woo-reviewer-express',
     'com.commercebuild.woo-reviewer-donavon',
     'com.commercebuild.opencode-swarm',
+    'com.bhalecb.console',
 )
 STATE_FILES = ('review-intake.json', 'promotion-snapshot.json', 'priority-snapshot.json')
 
