@@ -206,6 +206,38 @@ class ReviewInstaller(unittest.TestCase):
         self.assertEqual(launch.call_args.args[0][:2], ['launchctl', 'bootstrap'])
         self.assertTrue(self.module.live_plist(self.home).exists())
 
+    def test_activate_refuses_while_console_supervisor_is_loaded(self):
+        sha = '9' * 40
+        tree = self.reviewed_tree()
+        with mock.patch.object(self.module, 'command', side_effect=['', sha, tree]), \
+                mock.patch.object(self.module, 'require_reviewed_main_commit'):
+            self.module.install(self.repo, self.home, 'openai/review-model')
+
+        def command(*args):
+            return 'commercebuild' if args[-2:] == ('--jq', '.login') else tree
+
+        def loaded(label):
+            return label == 'com.bhalecb.console'
+
+        with mock.patch.object(self.module, 'command', side_effect=command), \
+                mock.patch.object(self.module, 'require_reviewed_main_commit'), \
+                mock.patch.object(self.module, 'loaded', side_effect=loaded), \
+                mock.patch.object(self.module.shutil, 'which', return_value='/usr/bin/opencode'), \
+                mock.patch.object(self.module.subprocess, 'run') as launch:
+            with self.assertRaisesRegex(RuntimeError, 'A swarm LaunchAgent is loaded'):
+                self.module.activate(self.home)
+        launch.assert_not_called()
+        self.assertFalse(self.module.live_plist(self.home).exists())
+
+        with mock.patch.object(self.module, 'command', side_effect=command), \
+                mock.patch.object(self.module, 'require_reviewed_main_commit'), \
+                mock.patch.object(self.module, 'loaded', return_value=False), \
+                mock.patch.object(self.module.shutil, 'which', return_value='/usr/bin/opencode'), \
+                mock.patch.object(self.module.subprocess, 'run') as launch:
+            self.module.activate(self.home)
+        self.assertEqual(launch.call_args.args[0][:2], ['launchctl', 'bootstrap'])
+        self.assertTrue(self.module.live_plist(self.home).exists())
+
     def test_main_commit_requires_exact_head_approval(self):
         sha, head = 'a' * 40, 'b' * 40
         pr = {'number': 3, 'merged_at': '2026-10-20T00:00:00Z',
