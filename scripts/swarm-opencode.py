@@ -455,7 +455,8 @@ def other_swarm_active():
         for label in ('com.commercebuild.woo-reviewer-swarm',
                       'com.commercebuild.woo-reviewer',
                       'com.commercebuild.woo-reviewer-express',
-                      'com.commercebuild.woo-reviewer-donavon'):
+                      'com.commercebuild.woo-reviewer-donavon',
+                      'com.bhalecb.console'):
             try:
                 result = subprocess.run(['launchctl', 'print', f'gui/{os.getuid()}/{label}'],
                                         capture_output=True, timeout=5)

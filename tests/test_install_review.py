@@ -421,6 +421,30 @@ class ReviewOnlyDispatch(unittest.TestCase):
         with mock.patch.object(module.subprocess, 'run', side_effect=launchctl):
             self.assertTrue(module.other_swarm_active())
 
+    def test_console_service_blocks_isolated_review_state(self):
+        module = load(ROOT / 'scripts/swarm-opencode.py', 'swarm_console_lock_test')
+        home = Path(tempfile.mkdtemp())
+        module.STATE = home / 'review'
+        module.LEGACY_STATE = home / 'legacy'
+        module.CLAUDE_RUNTIME = home / 'claude/runtime.json'
+        module.CODEX_REGISTRATION = home / 'codex/thread-id'
+        def launchctl(args, **_kwargs):
+            return mock.Mock(returncode=0 if 'bhalecb.console' in args[-1] else 1)
+        with mock.patch.object(module.subprocess, 'run', side_effect=launchctl):
+            self.assertTrue(module.other_swarm_active())
+
+    def test_no_competing_service_leaves_isolated_review_state_dispatchable(self):
+        module = load(ROOT / 'scripts/swarm-opencode.py', 'swarm_clear_lock_test')
+        home = Path(tempfile.mkdtemp())
+        module.STATE = home / 'review'
+        module.LEGACY_STATE = home / 'legacy'
+        module.CLAUDE_RUNTIME = home / 'claude/runtime.json'
+        module.CODEX_REGISTRATION = home / 'codex/thread-id'
+        def launchctl(args, **_kwargs):
+            return mock.Mock(returncode=1)
+        with mock.patch.object(module.subprocess, 'run', side_effect=launchctl):
+            self.assertFalse(module.other_swarm_active())
+
     def test_developer_queue_entry_never_dispatches_or_backfills(self):
         module = load(ROOT / 'scripts/swarm-opencode.py', 'swarm_review_only_test')
         state = Path(tempfile.mkdtemp())
